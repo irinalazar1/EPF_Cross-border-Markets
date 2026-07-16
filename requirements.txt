@@ -8,3 +8,5 @@ matplotlib>=3
 scipy>=1.4
 holidays
 pytz
+streamlit
+plotly
