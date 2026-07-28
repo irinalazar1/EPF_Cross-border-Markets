@@ -10,3 +10,4 @@ holidays
 pytz
 streamlit
 plotly
+bycrypt

@@ -6,6 +6,9 @@ import holidays
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import json
+import os
+import bcrypt
 
 # Run the Streamlit Dashboard using 'streamlit run app.py'
 
@@ -14,9 +17,8 @@ st.title('EPF Expert Review')
 
 
 # CONSTANTS
-EXPERT_IDS = ["expert_1", "expert_2", "expert_3", "expert_4", "expert_5"]
 FEEDBACK_LOG_PATH = "expert_feedback.csv"
-
+USERS_FILE_PATH = "users.json"
 
 # DATA LOADING
 @st.cache_data
@@ -28,7 +30,6 @@ def load_be_data():
     return df.sort_values("Date").reset_index(drop=True)
 
 df = load_be_data()
-
 
 # SHARED HELPER FUNCTIONS
 def get_available_dates(df):
@@ -105,14 +106,83 @@ def get_calendar_context(forecast_date):
         "is_bridge_day": is_bridge_day,
     }
 
+def make_simple_chart(hours, values, y_title):
+    figure = go.Figure()
+    scatter = go.Scatter(x=hours, y=values, mode="lines+markers", name=y_title)
+    figure.add_trace(scatter)
+    figure.update_layout(
+        xaxis_title="Hour of day",
+        yaxis_title=y_title,
+        xaxis=dict(dtick=1),
+    )
+    return figure
+
 # st.write(get_calendar_context(date(2024, 1, 1)))   # known Belgian holiday — New Year's Day
 # st.write(get_calendar_context(date(2024, 1, 15)))  # a random Monday, not a holiday
+
+# HASHING HELPER FUNCTIONS
+def hash_password(password):
+    # bcrypt requires bytes, so we encode the string to utf-8
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    # Store as a regular string in the JSON file
+    return hashed.decode('utf-8')
+
+def check_password(password, hashed_password):
+    # Verify the provided password against the stored hash
+    return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+# USER MANAGEMENT FUNCTIONS
+def load_users():
+    if not os.path.exists(USERS_FILE_PATH):
+        # Hash the default admin password upon creation and give them a default email
+        hashed_admin = hash_password("admin_password")
+        default_users = {
+            "admin": {
+                "password": hashed_admin, 
+                "role": "admin",
+                "email": "admin@example.com"
+            }
+        }
+        with open(USERS_FILE_PATH, "w") as f:
+            json.dump(default_users, f)
+        return default_users
+    
+    with open(USERS_FILE_PATH, "r") as f:
+        return json.load(f)
+
+def save_new_user(username, password, email, role):
+    users = load_users()
+    # Hash the new user's password and include their email address
+    hashed_pass = hash_password(password)
+    users[username] = {
+        "password": hashed_pass, 
+        "role": role, 
+        "email": email.strip().lower() # Normalize emails to lowercase
+    }
+    with open(USERS_FILE_PATH, "w") as f:
+        json.dump(users, f)
 
 
 # PAGE 1: REVIEW & ADJUST
 def page_review_and_adjust():
+    current_user = st.session_state["logged_in_user"]
+    current_role = st.session_state["role"]
+
     with st.sidebar:
-        expert_id = st.selectbox("Expert ID", EXPERT_IDS)
+        # ROLE-BASED ACCESS DEFINES THE EXPERT_ID
+        if current_role == "admin":
+            users = load_users()
+            expert_list = [u for u, d in users.items() if d["role"] == "expert"]
+            
+            # 1. If Admin: expert_id is defined by whichever expert they select from the dropdown
+            expert_id = st.selectbox("Expert ID (Admin View)", expert_list)
+            
+        else:
+            # 2. If Expert: expert_id is strictly defined as their own username
+            expert_id = current_user
+            st.write(f"**Expert ID:** {expert_id}")
+
         available_dates = get_available_dates(df)
         forecast_date = st.date_input(
             "Forecast date (day d+1)",
@@ -146,6 +216,14 @@ def page_review_and_adjust():
         fig = make_chart(hours, forecast, lower, upper)
         st.plotly_chart(fig)
 
+    weather_choice = st.selectbox("Show hourly:", ["Temperature", "Humidity"])
+    if weather_choice == "Temperature":
+        fig2 = make_simple_chart(hours, day_rows["Temp"].values, "Temperature (°C)")
+        st.plotly_chart(fig2)
+    elif weather_choice == "Humidity":
+        fig2 = make_simple_chart(hours, day_rows["Hum"].values, "Humidity (%)")
+        st.plotly_chart(fig2)
+
     low_threshold = np.percentile(forecast, 5)
     high_threshold = np.percentile(forecast, 95)
 
@@ -159,11 +237,28 @@ def page_review_and_adjust():
        "price_ch": day_rows["Price_CH"].values,
        "price_de_lu": day_rows["Price_DE_LU_15min"].values,
        "price_at": day_rows["Price_AT_15min"].values,
-   })
+    })
 
     key = f"{expert_id}_{forecast_date}"
 
     if key not in st.session_state:
+        # --- THE FIX: Try to load past adjustments from the CSV ---
+        if os.path.exists(FEEDBACK_LOG_PATH) and os.path.getsize(FEEDBACK_LOG_PATH) > 0:
+            log = pd.read_csv(FEEDBACK_LOG_PATH)
+            log["forecast_date"] = pd.to_datetime(log["forecast_date"]).dt.date
+            
+            # Find past submissions for this specific expert and date
+            past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
+            
+            if not past_sub.empty:
+                # Take the most recent 24 rows and sort them properly
+                past_sub = past_sub.tail(24).sort_values("hour")
+                
+                # Safely overwrite the default columns with the saved work
+                if len(past_sub) == 24:
+                    working_df["adjusted"] = past_sub["adjusted"].values
+                    working_df["flagged"] = past_sub["flagged"].values
+
         st.session_state[key] = working_df
 
     working = st.session_state[key]
@@ -179,13 +274,16 @@ def page_review_and_adjust():
     st.session_state[key] = edited
 
     if st.button("Submit feedback"):
-        rows = working.copy()
-        rows["expert_id"] = expert_id
-        rows["forecast_date"] = forecast_date
-        rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        save_feedback(rows)
-        st.success(f"Saved {len(rows)} rows for {expert_id} on {forecast_date}.")
-
+            # --- NEW SAFEGUARD ---
+            if not expert_id:
+                st.error("Error: No Expert ID found. Cannot save data. (If you are an Admin, ensure an expert exists in the system first).")
+            else:
+                rows = edited.copy()
+                rows["expert_id"] = expert_id
+                rows["forecast_date"] = forecast_date
+                rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                save_feedback(rows)
+                st.success(f"Saved {len(rows)} rows for {expert_id} on {forecast_date}.")
 
 
 # PAGE 2: REVEAL & EVALUATE
@@ -286,9 +384,85 @@ def page_expert_scoreboard():
 
     st.dataframe(scoreboard, hide_index=True)
 
+def auth_screen():
+    st.subheader("Welcome to EPF Expert Review")
+    
+    # Use a horizontal radio button instead of tabs to prevent state resets
+    auth_mode = st.radio("Choose an option:", ["Log In", "Create Account"], horizontal=True)
+    st.divider()
+    
+    # ------------------ LOG IN ------------------
+    if auth_mode == "Log In":
+        login_user = st.text_input("Username", key="login_user")
+        login_pass = st.text_input("Password", type="password", key="login_pass")
+        
+        if st.button("Log In"):
+            users = load_users()
+            if login_user in users and check_password(login_pass, users[login_user]["password"]):
+                st.session_state["logged_in_user"] = login_user
+                st.session_state["role"] = users[login_user]["role"]
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+                
+    # -------------- CREATE ACCOUNT --------------
+    elif auth_mode == "Create Account":
+        new_email = st.text_input("Email Address", key="new_email")
+        new_user = st.text_input("New Username", key="new_user")
+        new_pass = st.text_input("New Password", type="password", key="new_pass")
+        new_role = st.selectbox("Role", ["expert", "admin"], key="new_role")
+        
+        if st.button("Create Account"):
+            users = load_users()
+            
+            # Clean up inputs
+            username_input = new_user.strip()
+            email_input = new_email.strip().lower()
+            
+            # Check if email already exists in the system
+            email_exists = any(account.get("email") == email_input for account in users.values())
+            
+            if not username_input or not email_input or not new_pass:
+                st.error("All fields (Username, Email, and Password) are required.")
+            elif username_input in users:
+                st.error("This username is already taken. Please choose another.")
+            elif email_exists:
+                st.error("This email address is already registered. Please use another or log in.")
+            else:
+                # Pass the selected role to the save function
+                save_new_user(username_input, new_pass, email_input, new_role)
+                st.success("Account created successfully! You can now switch to the Log In option.")
+
+
 # MAIN
 def main():
-    page = st.sidebar.radio("Page", ["Review & Adjust", "Reveal & Evaluate", "Expert Scoreboard"])
+    # Gate the app with the authentication screen
+    if "logged_in_user" not in st.session_state:
+        auth_screen()
+        return
+
+    current_user = st.session_state["logged_in_user"]
+    current_role = st.session_state["role"]
+    
+    with st.sidebar:
+        st.write(f"Logged in as: **{current_user}** ({current_role})")
+        if st.button("Log Out"):
+            st.session_state.clear()
+            st.rerun()
+            
+        st.divider()
+        
+        # ROLE-BASED NAVIGATION: Hide evaluation pages from experts
+        if current_role == "admin":
+            # Admins can see everything
+            pages = ["Review & Adjust", "Reveal & Evaluate", "Expert Scoreboard"]
+        else:
+            # Experts can only see the adjustment page
+            pages = ["Review & Adjust"]
+            
+        page = st.radio("Page", pages)
+
+    # Route to the selected page
     if page == "Review & Adjust":
         page_review_and_adjust()
     elif page == "Reveal & Evaluate":
