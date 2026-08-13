@@ -6,19 +6,15 @@ import holidays
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import json
-import os
 import bcrypt
+import json
+import re
+from db import init_db, load_users, save_new_user, save_feedback, load_feedback
 
 # Run the Streamlit Dashboard using 'streamlit run app.py'
 
 st.set_page_config(page_title='EPF Expert Review', layout='wide')
 st.title('EPF Expert Review')
-
-
-# CONSTANTS
-FEEDBACK_LOG_PATH = "expert_feedback.csv"
-USERS_FILE_PATH = "users.json"
 
 # DATA LOADING
 @st.cache_data
@@ -30,6 +26,7 @@ def load_be_data():
     return df.sort_values("Date").reset_index(drop=True)
 
 df = load_be_data()
+init_db()
 
 # SHARED HELPER FUNCTIONS
 def get_available_dates(df):
@@ -54,7 +51,7 @@ def naive_forecast(forecast_date, df):
 
     return source_rows["Price"].values, source_date
 
-def make_chart(hours, forecast, lower, upper):
+def make_chart(hours, forecast, lower, upper, solar=None, wind=None, renewables_range=None):
     # Forecast line with a shaded uncertainty band.
     figure = go.Figure()
 
@@ -70,22 +67,24 @@ def make_chart(hours, forecast, lower, upper):
     scatter = go.Scatter(x=hours, y=forecast, mode="lines+markers", name="Naive Forecast")
     figure.add_trace(scatter)
 
-    figure.update_layout(
+    if solar is not None:
+        figure.add_trace(go.Scatter(x=hours, y=solar, mode="lines", name="Solar (MW)", yaxis="y2", line=dict(color="orange")))
+    if wind is not None:
+        figure.add_trace(go.Scatter(x=hours, y=wind, mode="lines", name="Wind (MW)", yaxis="y2", line=dict(color="green")))
+
+    layout_kwargs = dict(  # Python dictionary, in case solar and wind are present
         xaxis_title="Hour of day",
         yaxis_title="EUR / MWh",
         xaxis=dict(dtick=1),
     )
+    if solar is not None or wind is not None:
+        y2_settings = dict(title="MW", overlaying="y", side="right")
+        if renewables_range is not None:
+            y2_settings["range"] = renewables_range
+        layout_kwargs["yaxis2"] = y2_settings
+    figure.update_layout(**layout_kwargs)
 
     return figure
-
-def save_feedback(rows_df):
-    # Append submitted rows to the CSV log, creating it if it doesn't exist (or is empty)
-    if os.path.exists(FEEDBACK_LOG_PATH) and os.path.getsize(FEEDBACK_LOG_PATH) > 0:
-        existing = pd.read_csv(FEEDBACK_LOG_PATH)
-        combined = pd.concat([existing, rows_df], ignore_index=True)
-    else:
-        combined = rows_df
-    combined.to_csv(FEEDBACK_LOG_PATH, index=False)
 
 def get_calendar_context(forecast_date):
     be_holidays = holidays.Belgium(years=[forecast_date.year - 1, forecast_date.year, forecast_date.year + 1])
@@ -132,36 +131,21 @@ def check_password(password, hashed_password):
     # Verify the provided password against the stored hash
     return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
 
-# USER MANAGEMENT FUNCTIONS
-def load_users():
-    if not os.path.exists(USERS_FILE_PATH):
-        # Hash the default admin password upon creation and give them a default email
-        hashed_admin = hash_password("admin_password")
-        default_users = {
-            "admin": {
-                "password": hashed_admin, 
-                "role": "admin",
-                "email": "admin@example.com"
-            }
-        }
-        with open(USERS_FILE_PATH, "w") as f:
-            json.dump(default_users, f)
-        return default_users
-    
-    with open(USERS_FILE_PATH, "r") as f:
-        return json.load(f)
+# USER VALIDATION FUNCTION
+def validate_registration(username, email, password):
+    if not username or not email or not password:
+        return False, "All fields (Username, Email, and Password) are required."
 
-def save_new_user(username, password, email, role):
-    users = load_users()
-    # Hash the new user's password and include their email address
-    hashed_pass = hash_password(password)
-    users[username] = {
-        "password": hashed_pass, 
-        "role": role, 
-        "email": email.strip().lower() # Normalize emails to lowercase
-    }
-    with open(USERS_FILE_PATH, "w") as f:
-        json.dump(users, f)
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return False, "Please enter a valid email address."
+
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long."
+
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"[0-9]", password):
+        return False, "Password must contain both letters and numbers."
+
+    return True, ""
 
 
 # PAGE 1: REVIEW & ADJUST
@@ -212,8 +196,19 @@ def page_review_and_adjust():
     lower = forecast - band_width
     upper = forecast + band_width
 
+    renewables_max = max(day_rows["Solar"].max(), day_rows["Wind"].max())
+    renewables_range = [0, renewables_max * 1.1]  # 10% padding above the max
+
+    show_solar = st.checkbox("Show solar on chart")
+    show_wind = st.checkbox("Show wind on chart")
+
     if forecast is not None:
-        fig = make_chart(hours, forecast, lower, upper)
+        fig = make_chart(
+            hours, forecast, lower, upper,
+            solar=day_rows["Solar"].values if show_solar else None,
+            wind=day_rows["Wind"].values if show_wind else None,
+            renewables_range=renewables_range,
+        )
         st.plotly_chart(fig)
 
     weather_choice = st.selectbox("Show hourly:", ["Temperature", "Humidity"])
@@ -242,19 +237,13 @@ def page_review_and_adjust():
     key = f"{expert_id}_{forecast_date}"
 
     if key not in st.session_state:
-        # --- THE FIX: Try to load past adjustments from the CSV ---
-        if os.path.exists(FEEDBACK_LOG_PATH) and os.path.getsize(FEEDBACK_LOG_PATH) > 0:
-            log = pd.read_csv(FEEDBACK_LOG_PATH)
-            log["forecast_date"] = pd.to_datetime(log["forecast_date"]).dt.date
-            
-            # Find past submissions for this specific expert and date
+        log = load_feedback()
+
+        if not log.empty:
             past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
-            
+
             if not past_sub.empty:
-                # Take the most recent 24 rows and sort them properly
                 past_sub = past_sub.tail(24).sort_values("hour")
-                
-                # Safely overwrite the default columns with the saved work
                 if len(past_sub) == 24:
                     working_df["adjusted"] = past_sub["adjusted"].values
                     working_df["flagged"] = past_sub["flagged"].values
@@ -262,6 +251,8 @@ def page_review_and_adjust():
         st.session_state[key] = working_df
 
     working = st.session_state[key]
+    is_read_only = (current_role == "admin")
+
     edited = st.data_editor(working, 
                             column_config={
            "price_ch": st.column_config.NumberColumn("CH price", disabled=True),
@@ -269,12 +260,14 @@ def page_review_and_adjust():
            "price_at": st.column_config.NumberColumn("AT price", disabled=True),
            "flagged": st.column_config.CheckboxColumn("Flag volatility"),
        },
+       disabled=is_read_only,
        key=f"editor_{key}")
+        
+    if not is_read_only:
+        st.session_state[key] = edited
+        confidence = st.slider("How confident are you in these adjustments?", 1, 5, 3)
 
-    st.session_state[key] = edited
-
-    if st.button("Submit feedback"):
-            # --- NEW SAFEGUARD ---
+        if st.button("Submit feedback"):
             if not expert_id:
                 st.error("Error: No Expert ID found. Cannot save data. (If you are an Admin, ensure an expert exists in the system first).")
             else:
@@ -282,32 +275,30 @@ def page_review_and_adjust():
                 rows["expert_id"] = expert_id
                 rows["forecast_date"] = forecast_date
                 rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                rows["confidence"] = confidence
                 save_feedback(rows)
                 st.success(f"Saved {len(rows)} rows for {expert_id} on {forecast_date}.")
+    else:
+        st.info(f"Viewing {expert_id}'s submission (read-only — admins cannot submit on behalf of experts).")
 
 
 # PAGE 2: REVEAL & EVALUATE
 def page_reveal_and_evaluate():
     st.title("Reveal & Evaluate")
 
-    if not os.path.exists(FEEDBACK_LOG_PATH) or os.path.getsize(FEEDBACK_LOG_PATH) == 0:
-        st.warning("No submissions yet.")
-        return
-
-    log = pd.read_csv(FEEDBACK_LOG_PATH)
+    log = load_feedback()
     if log.empty:
         st.warning("No submissions yet.")
         return
 
     expert_id = st.selectbox("Expert ID", sorted(log["expert_id"].dropna().unique()))
-    log["forecast_date"] = pd.to_datetime(log["forecast_date"]).dt.date
     available_dates = sorted(log.loc[log["expert_id"] == expert_id, "forecast_date"].dropna().unique())
     forecast_date = st.selectbox("Forecast date", available_dates)
 
     submission = (
         log.loc[
             (log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date),
-            ["hour", "forecast", "adjusted"],
+            ["hour", "forecast", "adjusted", "confidence"],
         ]
         .sort_values("hour")
     )
@@ -317,9 +308,12 @@ def page_reveal_and_evaluate():
     forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
     adjusted_mae = (evaluation["adjusted"] - evaluation["actual"]).abs().mean()
 
-    forecast_metric, adjusted_metric = st.columns(2)
+    confidence_rating = submission["confidence"].iloc[0]
+
+    forecast_metric, adjusted_metric, confidence_metric = st.columns(3)
     forecast_metric.metric("Forecast MAE", f"{forecast_mae:.2f} EUR/MWh")
     adjusted_metric.metric("Adjusted MAE", f"{adjusted_mae:.2f} EUR/MWh")
+    confidence_metric.metric("Expert confidence", f"{confidence_rating}/5")
 
     if adjusted_mae < forecast_mae:
         st.write("Verdict: the expert adjustment improved the forecast.")
@@ -333,16 +327,10 @@ def page_reveal_and_evaluate():
 def page_expert_scoreboard():
     st.title("Expert Scoreboard")
 
-    if not os.path.exists(FEEDBACK_LOG_PATH) or os.path.getsize(FEEDBACK_LOG_PATH) == 0:
-        st.warning("No submissions yet.")
-        return
-
-    log = pd.read_csv(FEEDBACK_LOG_PATH)
+    log = load_feedback()
     if log.empty:
         st.warning("No submissions yet.")
         return
-
-    log["forecast_date"] = pd.to_datetime(log["forecast_date"]).dt.date
 
     results = []
     for (expert_id, forecast_date), group in log.groupby(["expert_id", "forecast_date"]):
@@ -361,6 +349,7 @@ def page_expert_scoreboard():
             "forecast_mae": forecast_mae,
             "adjusted_mae": adjusted_mae,
             "improvement": forecast_mae - adjusted_mae,
+            "confidence": group["confidence"].iloc[0],
         })
 
     if not results:
@@ -375,12 +364,14 @@ def page_expert_scoreboard():
             avg_improvement=("improvement", "mean"),
             days_reviewed=("forecast_date", "nunique"),
             win_rate=("improvement", lambda s: (s > 0).mean()),
+            avg_confidence=("confidence", "mean"),
         )
         .reset_index()
         .sort_values("avg_improvement", ascending=False)
     )
     scoreboard["win_rate"] = (scoreboard["win_rate"] * 100).round(1)
     scoreboard["avg_improvement"] = scoreboard["avg_improvement"].round(2)
+    scoreboard["avg_confidence"] = scoreboard["avg_confidence"].round(1)
 
     st.dataframe(scoreboard, hide_index=True)
 
@@ -410,7 +401,7 @@ def auth_screen():
         new_email = st.text_input("Email Address", key="new_email")
         new_user = st.text_input("New Username", key="new_user")
         new_pass = st.text_input("New Password", type="password", key="new_pass")
-        new_role = st.selectbox("Role", ["expert", "admin"], key="new_role")
+        new_role = st.selectbox("Role", ["expert"], key="new_role") # add admin to the list if you want to possess the admin role and see all the expert' results
         
         if st.button("Create Account"):
             users = load_users()
@@ -421,16 +412,16 @@ def auth_screen():
             
             # Check if email already exists in the system
             email_exists = any(account.get("email") == email_input for account in users.values())
-            
-            if not username_input or not email_input or not new_pass:
-                st.error("All fields (Username, Email, and Password) are required.")
+            is_valid, validation_message = validate_registration(username_input, email_input, new_pass)
+
+            if not is_valid:
+                st.error(validation_message)
             elif username_input in users:
                 st.error("This username is already taken. Please choose another.")
             elif email_exists:
                 st.error("This email address is already registered. Please use another or log in.")
             else:
-                # Pass the selected role to the save function
-                save_new_user(username_input, new_pass, email_input, new_role)
+                save_new_user(username_input, hash_password(new_pass), email_input, new_role)
                 st.success("Account created successfully! You can now switch to the Log In option.")
 
 
