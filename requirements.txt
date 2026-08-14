@@ -11,3 +11,4 @@ pytz
 streamlit
 plotly
 bycrypt
+python-dotenv
