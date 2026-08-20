@@ -20,11 +20,11 @@ load_dotenv()
 # Run the Streamlit Dashboard using 'streamlit run app.py'
 
 st.set_page_config(page_title='EPF Expert Review', layout='wide')
-st.title('EPF Expert Review')
+st.title('Electricity Price Forecasting -  Expert Review')
 
-# --------------------------------------------------------------------------
+
 # CONSTANTS
-# --------------------------------------------------------------------------
+
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = "margaridamascarenhas"
@@ -38,6 +38,211 @@ BE_DATA_FILE = "Data_BE_UTC.csv"
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
 
 EXPERT_ROLES = ["expert"]  # roles selectable at self-registration
+
+
+
+# THEME (dark / light mode toggle)
+
+
+def get_palette(dark: bool) -> dict:
+    """Single source of truth for theme colors, shared by the injected CSS
+    and the Plotly charts, so both layers always agree on what's readable."""
+    if dark:
+        return {
+            "bg": "#0e1117",
+            "bg_secondary": "#161b22",
+            "sidebar_bg": "#161b22",
+            "card_bg": "#1c222b",
+            "text": "#e6edf3",
+            "text_muted": "#9aa5b1",
+            "border": "#2d3540",
+            "grid": "#2d3540",
+            "input_bg": "#1c222b",
+            "accent": "#6366f1",
+            "accent_text": "#ffffff",
+        }
+    return {
+        "bg": "#ffffff",
+        "bg_secondary": "#f6f7f9",
+        "sidebar_bg": "#f6f7f9",
+        "card_bg": "#ffffff",
+        "text": "#1f2328",
+        "text_muted": "#57606a",
+        "border": "#d7dbe0",
+        "grid": "#e3e6ea",
+        "input_bg": "#ffffff",
+        "accent": "#4f46e5",
+        "accent_text": "#ffffff",
+    }
+
+
+def apply_theme():
+    """Renders the dark/light toggle in the sidebar and injects matching CSS.
+    Dark mode is the default. Call this once, first thing, in main()."""
+    if "dark_mode" not in st.session_state:
+        st.session_state["dark_mode"] = True  # dark mode by default
+
+    st.sidebar.toggle("🌙 Dark mode", key="dark_mode")
+    dark = st.session_state["dark_mode"]
+    palette = get_palette(dark)
+
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+            background-color: {palette['bg']};
+            color: {palette['text']};
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: {palette['sidebar_bg']};
+            border-right: 1px solid {palette['border']};
+        }}
+        [data-testid="stSidebar"] * {{
+            color: {palette['text']} !important;
+        }}
+        h1, h2, h3, h4, h5, h6, p, label, span, li, .stMarkdown {{
+            color: {palette['text']};
+        }}
+        [data-testid="stMetric"] {{
+            background-color: {palette['card_bg']};
+            border: 1px solid {palette['border']};
+            border-radius: 10px;
+            padding: 0.75rem 1rem;
+        }}
+        [data-testid="stMetricLabel"] {{
+            color: {palette['text_muted']} !important;
+        }}
+        [data-testid="stMetricValue"] {{
+            color: {palette['text']} !important;
+        }}
+        [data-testid="stExpander"], [data-testid="stForm"] {{
+            background-color: {palette['card_bg']};
+            border: 1px solid {palette['border']};
+            border-radius: 10px;
+        }}
+        div[data-baseweb="input"], div[data-baseweb="select"], div[data-baseweb="textarea"] {{
+            background-color: {palette['input_bg']} !important;
+            border-color: {palette['border']} !important;
+        }}
+        input, textarea {{
+            background-color: {palette['input_bg']} !important;
+            color: {palette['text']} !important;
+        }}
+        .stButton > button, .stFormSubmitButton > button {{
+            background-color: {palette['accent']};
+            color: {palette['accent_text']};
+            border: none;
+            border-radius: 8px;
+        }}
+        .stButton > button:hover, .stFormSubmitButton > button:hover {{
+            filter: brightness(1.1);
+        }}
+        hr {{
+            border-color: {palette['border']};
+        }}
+        [data-testid="stDataFrame"], [data-testid="stDataEditor"] {{
+            border: 1px solid {palette['border']};
+            border-radius: 8px;
+        }}
+        [data-testid="stAlert"] {{
+            background-color: {palette['card_bg']};
+            color: {palette['text']} !important;
+            border: 1px solid {palette['border']};
+        }}
+        [data-testid="stAlert"] * {{
+            color: {palette['text']} !important;
+        }}
+        /* Selectbox/radio dropdown menus render in a portal attached to
+           <body>, outside the sidebar/app containers above, so they need
+           their own rule or their text is invisible against the popup's
+           own background in light mode. */
+        div[data-baseweb="popover"], div[data-baseweb="menu"], ul[role="listbox"] {{
+            background-color: {palette['card_bg']} !important;
+        }}
+        div[data-baseweb="popover"] *, div[data-baseweb="menu"] *, ul[role="listbox"] * {{
+            color: {palette['text']} !important;
+        }}
+        li[role="option"]:hover, li[aria-selected="true"] {{
+            background-color: {palette['bg_secondary']} !important;
+        }}
+        /* The date picker's month/year header lives in a separate baseweb
+        wrapper from the day grid itself — cover both, or the header text
+        stays stuck on its default color regardless of mode. */
+        div[data-baseweb="datepicker"], div[data-baseweb="calendar"] {{
+            background-color: {palette['card_bg']} !important;
+        }}
+        div[data-baseweb="datepicker"] *, div[data-baseweb="calendar"] * {{
+            color: {palette['text']} !important;
+        }}
+        div[data-baseweb="calendar"] [role="gridcell"] > div {{
+            background-color: transparent !important;
+        }}
+        /* Icon glyphs (password show/hide, calendar nav arrows, expander
+        chevrons, sidebar icons) are SVGs with their own fixed color that
+        doesn't follow the page text color automatically — scoped to
+        Streamlit's own UI chrome only, never the Plotly charts, which
+        manage their own colors via the template. */
+        button svg, [role="button"] svg,
+        div[data-baseweb="input"] svg, div[data-baseweb="select"] svg,
+        div[data-baseweb="popover"] svg, div[data-baseweb="calendar"] svg,
+        div[data-baseweb="datepicker"] svg,
+        [data-testid="stExpander"] svg, [data-testid="stSidebar"] svg {{
+            fill: {palette['text']} !important;
+            stroke: {palette['text']} !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    return dark
+
+
+def current_plotly_template():
+    return "plotly_dark" if st.session_state.get("dark_mode", True) else "plotly_white"
+
+
+def themed(figure):
+    """Applies the current dark/light template and makes the chart background
+    transparent so it blends with the page. Text, legend, and gridline colors
+    are set explicitly (not just left to the template default) so they can
+    never end up washed out or invisible in either mode."""
+    dark = st.session_state.get("dark_mode", True)
+    palette = get_palette(dark)
+
+    figure.update_layout(
+        template=current_plotly_template(),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=palette["text"]),
+        legend=dict(
+            font=dict(color=palette["text"]),
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        xaxis=dict(
+            gridcolor=palette["grid"],
+            zerolinecolor=palette["grid"],
+            linecolor=palette["border"],
+            tickfont=dict(color=palette["text_muted"]),
+            title_font=dict(color=palette["text"]),
+        ),
+        yaxis=dict(
+            gridcolor=palette["grid"],
+            zerolinecolor=palette["grid"],
+            linecolor=palette["border"],
+            tickfont=dict(color=palette["text_muted"]),
+            title_font=dict(color=palette["text"]),
+        ),
+        yaxis2=dict(
+            tickfont=dict(color=palette["text_muted"]),
+            title_font=dict(color=palette["text"]),
+        ),
+        hoverlabel=dict(
+            font=dict(color=palette["text"]),
+            bgcolor=palette["card_bg"],
+            bordercolor=palette["border"],
+        ),
+    )
+    return figure
 
 
 # --------------------------------------------------------------------------
@@ -202,7 +407,7 @@ def make_chart(timestamps, forecast, inner_lower=None, inner_upper=None,
         layout_kwargs["yaxis2"] = y2_settings
 
     figure.update_layout(**layout_kwargs)
-    return figure
+    return themed(figure)
 
 
 def make_simple_chart(timestamps, values, y_title):
@@ -217,7 +422,7 @@ def make_simple_chart(timestamps, values, y_title):
         yaxis_title=y_title,
         xaxis=dict(tickformat="%H:%M", dtick=3600000, range=[ts_min, ts_max]),
     )
-    return figure
+    return themed(figure)
 
 
 def make_renewables_chart(timestamps, solar=None, wind=None):
@@ -238,7 +443,7 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(t=60),
     )
-    return figure
+    return themed(figure)
 
 
 # --------------------------------------------------------------------------
@@ -359,35 +564,31 @@ def page_review_and_adjust():
         st.caption("QR uncertainty bands unavailable for this date.")
 
     if context_available:
-        weather_col, renewables_col = st.columns(2)
+        with st.container(border=True):
+            st.subheader("Solar & Wind - Renewables")
+            sc1, sc2 = st.columns(2)
+            show_solar = sc1.toggle("Solar", value=True)
+            show_wind = sc2.toggle("Wind", value=True)
 
-        with weather_col:
-            with st.container(border=True):
-                st.subheader("Weather")
-                weather_choice = st.selectbox("Show hourly:", ["Temperature", "Humidity"])
-                if weather_choice == "Temperature":
-                    st.plotly_chart(make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values,
-                                                       "Temperature (°C)"), width="stretch")
-                elif weather_choice == "Humidity":
-                    st.plotly_chart(make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values,
-                                                       "Humidity (%)"), width="stretch")
+            wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
+            solar_vals = day_rows["Solar_BE"].values if show_solar else None
+            wind_vals = wind_total.values if show_wind else None
 
-        with renewables_col:
-                    with st.container(border=True):
-                        st.subheader("Solar & Wind")
-                        sc1, sc2 = st.columns(2)
-                        show_solar = sc1.checkbox("Solar", value=True)
-                        show_wind = sc2.checkbox("Wind", value=True)
+            if solar_vals is None and wind_vals is None:
+                st.info("Select at least one series to display.")
+            else:
+                st.plotly_chart(make_renewables_chart(day_rows["Date"].values, solar=solar_vals, wind=wind_vals),
+                                width="stretch")
 
-                        wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
-                        solar_vals = day_rows["Solar_BE"].values if show_solar else None
-                        wind_vals = wind_total.values if show_wind else None
-
-                        if solar_vals is None and wind_vals is None:
-                            st.info("Select at least one series to display.")
-                        else:
-                            st.plotly_chart(make_renewables_chart(day_rows["Date"].values, solar=solar_vals, wind=wind_vals),
-                                            width="stretch")
+        with st.container(border=True):
+            st.subheader("Weather")
+            weather_choice = st.selectbox("Show hourly:", ["Hide", "Temperature", "Humidity"])
+            if weather_choice == "Temperature":
+                st.plotly_chart(make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values,
+                                                "Temperature (°C)"), width="stretch")
+            elif weather_choice == "Humidity":
+                st.plotly_chart(make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values,
+                                                "Humidity (%)"), width="stretch")
 
     hour_of_slot = np.array([pd.Timestamp(ts).hour for ts in timestamps])
     time_label = [pd.Timestamp(ts).strftime("%H:%M") for ts in timestamps]
@@ -396,8 +597,8 @@ def page_review_and_adjust():
         "timestamp_slot": timestamps,
         "hour": hour_of_slot,
         "time_label": time_label,
-        "forecast": forecast,
-        "adjusted": forecast.copy(),
+        "forecast": np.round(forecast, 2),
+        "adjusted": np.round(forecast, 2),
         "flagged": flagged,
         "load_fr": day_rows["Load_FR"].values if context_available else np.nan,
     })
@@ -434,7 +635,7 @@ def page_review_and_adjust():
                     column_config={
                         "time_label": st.column_config.TextColumn("Time", disabled=True),
                         "forecast": st.column_config.NumberColumn("DNN forecast", disabled=True, format="%.2f"),
-                        "adjusted": st.column_config.NumberColumn("Adjusted", disabled=True, format="%.2f"),
+                        "adjusted": st.column_config.NumberColumn("Adjusted", format="%.2f"),
                         "flagged": st.column_config.CheckboxColumn("Flag", disabled=True),
                     },
                     disabled=True,
@@ -467,7 +668,7 @@ def page_review_and_adjust():
                         column_config={
                             "time_label": st.column_config.TextColumn("Time", disabled=True),
                             "forecast": st.column_config.NumberColumn("DNN forecast", disabled=True, format="%.2f"),
-                            "adjusted": st.column_config.NumberColumn("Adjusted", step=1.0, format="%.2f"),
+                            "adjusted": st.column_config.NumberColumn("Adjusted", step=0.01, format="%.2f"),
                             "flagged": st.column_config.CheckboxColumn("Flag"),
                         },
                         hide_index=True,
@@ -671,12 +872,41 @@ def auth_screen():
                 save_new_user(username_input, hash_password(new_pass), email_input, new_role)
                 st.success("Account created successfully! You can now switch to the Log In option.")
 
+# def page_embedded_dashboard():
+#     st.title("Margarida's Dashboard")
+#     st.caption(
+#         "This is her dashboard_app.py, unmodified, running as a separate Streamlit "
+#         "process and embedded here via an iframe -- it has its own LEAR/XGB/DNN/"
+#         "Ensemble views and does not share a session or login with this app."
+#     )
+
+#     dashboard_url = st.session_state.get("dashboard_url", "http://localhost:8502")
+#     with st.expander("Embed settings", expanded=False):
+#         dashboard_url = st.text_input(
+#             "Dashboard URL",
+#             value=dashboard_url,
+#             help="Must be running separately: streamlit run dashboard_app.py --server.port 8502",
+#         )
+#         st.session_state["dashboard_url"] = dashboard_url
+
+#     st.iframe(dashboard_url, height=1400)
+
+def page_embedded_dashboard():
+    st.title("Margarida's Dashboard")
+    st.caption(
+        "Her dashboard, hosted on Hugging Face Spaces and embedded here via an "
+        "iframe -- it has its own LEAR/XGB/DNN/Ensemble views and does not share "
+        "a session or login with this app."
+    )
+    st.iframe("https://eds-lab-dam-price-forecast.hf.space/", height=1400)
 
 # --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
 
 def main():
+    apply_theme()
+
     if "logged_in_user" not in st.session_state:
         auth_screen()
         return
@@ -693,9 +923,9 @@ def main():
         st.divider()
 
         if current_role == "admin":
-            pages = ["Review & Adjust", "Reveal & Evaluate", "Expert Scoreboard"]
+            pages = ["Review & Adjust","Deterministic Forecast Analysis", "Reveal & Evaluate", "Expert Scoreboard"]
         else:
-            pages = ["Review & Adjust"]
+            pages = ["Review & Adjust", "Deterministic Forecast Analysis"]
 
         page = st.radio("Page", pages)
 
@@ -705,6 +935,8 @@ def main():
         page_reveal_and_evaluate()
     elif page == "Expert Scoreboard":
         page_expert_scoreboard()
+    elif page == "Deterministic Forecast Analysis":
+        page_embedded_dashboard()
 
 
 if __name__ == "__main__":
