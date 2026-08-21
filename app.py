@@ -1,3 +1,54 @@
+"""
+EPF Expert Review -- a Streamlit dashboard for human-in-the-loop review of
+day-ahead electricity price forecasts for the Belgian market.
+
+WHAT THIS APP IS FOR
+---------------------
+A neural network (DNN) produces a day-ahead price forecast for Belgium at
+15-minute resolution (96 slots/day). Domain experts review that forecast,
+optionally adjust individual slots they disagree with, flag anomalies, and
+rate their own confidence. Once the delivery day has actually happened and
+its day-ahead auction has settled, admins can reveal the realized price and
+see whether each expert's adjustment improved or worsened accuracy (MAE)
+relative to the raw model forecast -- and aggregate that across experts on a
+scoreboard. The goal is to measure the value of human correction on top of
+the model, not just to collect opinions.
+
+ROLES
+-----
+- "expert": can only see and submit on the Review & Adjust page, and only
+  for their own submissions. Submissions are final -- no editing after
+  submit.
+- "admin": can view (but never submit on behalf of) any expert's Review &
+  Adjust page, plus the Reveal & Evaluate and Expert Scoreboard pages.
+
+DATA SOURCES
+------------
+Three CSVs are pulled live from a GitHub repo on every page load (cached
+for 30 min to absorb the daily 10AM/14h refreshes without hammering
+GitHub): the DNN forecast, the QR (quantile regression) uncertainty bands,
+and the realized Belgian market data (price, load, solar, wind, weather).
+See the GITHUB LOADING section below for the exact files/columns.
+
+PAGES
+-----
+1. Review & Adjust       -- the core workflow described above.
+2. Deterministic Forecast Analysis -- a separate, unrelated dashboard built
+   by a collaborator (LEAR/XGB/DNN/Ensemble model comparison), embedded via
+   iframe from its Hugging Face Space. It has its own UI and does not share
+   a session, login, or data pipeline with this app.
+3. Reveal & Evaluate (admin only) -- compares one expert's one-day
+   submission against the realized price once it has settled.
+4. Expert Scoreboard (admin only) -- aggregates every evaluated submission
+   across all experts into a leaderboard (avg. improvement, win rate, etc.).
+
+THEMING
+-------
+A dark/light toggle in the sidebar injects CSS (see apply_theme()) and
+drives a matching Plotly template (see themed()) so charts and UI chrome
+never fall out of sync with each other.
+"""
+
 import streamlit as st
 import datetime as dt
 import os
@@ -23,25 +74,37 @@ st.set_page_config(page_title='EPF Expert Review', layout='wide')
 st.title('Electricity Price Forecasting -  Expert Review')
 
 
+# --------------------------------------------------------------------------
 # CONSTANTS
+# --------------------------------------------------------------------------
 
-
+# GitHub repo that publishes the forecast/actuals CSVs this app consumes.
+# Read access requires GITHUB_TOKEN (set in .env / environment); the repo is
+# private, hence the auth header in fetch_csv_from_github() below.
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = "margaridamascarenhas"
 GITHUB_REPO = "DAM_Forecast_V4"
 GITHUB_BRANCH = "main"
 
-DNN_FILE = "DNN_forecasts_10AM.csv"
-QR_FILE = "QR_forecasts_10AM.csv"
-BE_DATA_FILE = "Data_BE_UTC.csv"
+DNN_FILE = "DNN_forecasts_10AM.csv"     # DNN point forecast + Imputed flag
+QR_FILE = "QR_forecasts_10AM.csv"       # Quantile regression uncertainty bands
+BE_DATA_FILE = "Data_BE_UTC.csv"        # Realized price, load, weather, renewables
 
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
 
-EXPERT_ROLES = ["expert"]  # roles selectable at self-registration
+EXPERT_ROLES = ["expert"]  # roles selectable at self-registration (no public admin signup)
 
 
 
+# --------------------------------------------------------------------------
 # THEME (dark / light mode toggle)
+#
+# get_palette() is the single source of truth for both layers below:
+#   - apply_theme() uses it to inject CSS that themes Streamlit's own chrome
+#     (sidebar, buttons, inputs, popovers, calendar, icons, etc.)
+#   - themed() uses it to give every Plotly chart matching colors, so charts
+#     never look out of sync with the rest of the page.
+# --------------------------------------------------------------------------
 
 
 def get_palette(dark: bool) -> dict:
@@ -198,6 +261,7 @@ def apply_theme():
 
 
 def current_plotly_template():
+    """Plotly template name matching the active dark/light toggle state."""
     return "plotly_dark" if st.session_state.get("dark_mode", True) else "plotly_white"
 
 
@@ -250,6 +314,10 @@ def themed(figure):
 # --------------------------------------------------------------------------
 
 def fetch_csv_from_github(owner, repo, branch, path, fname, token, usecols=None):
+    """Downloads a single CSV file's raw content from a GitHub repo and
+    parses it into a DataFrame. `token` is required for private repos (like
+    this one) -- passed as a Bearer token; requests with no token still work
+    against public repos but will 404/403 here since GITHUB_REPO is private."""
     raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}/{fname}"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     resp = requests.get(raw_url, headers=headers, timeout=30)
@@ -259,6 +327,9 @@ def fetch_csv_from_github(owner, repo, branch, path, fname, token, usecols=None)
 
 @st.cache_data(ttl=1800)  # 30 min -- catches both the 10AM and 14h daily refreshes without hammering GitHub
 def get_dnn_df():
+    """DNN point forecast: one row per 15-min slot, with DateTime,
+    DNN_expanding (the forecast value), and Imputed (True = that day's model
+    run failed and the previous day's forecast was carried forward)."""
     # Only 3 columns exist in this file already -- nothing to trim.
     df = fetch_csv_from_github(GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, "Forecast", DNN_FILE, GITHUB_TOKEN)
     df["DateTime"] = pd.to_datetime(df["DateTime"])
@@ -268,6 +339,9 @@ def get_dnn_df():
 
 @st.cache_data(ttl=1800)
 def get_qr_df():
+    """Quantile regression uncertainty bands for the DNN forecast: the
+    10th/90th percentile columns become the chart's "typical range", and the
+    1st/99th percentile columns become the wider "extreme range"."""
     # The real file has 41 columns (3 calibration windows x 13 quantiles each);
     # only the expanding-window bands we actually plot are fetched/parsed.
     cols = ["DateTime", "Imputed", "QR_expanding_q0.01", "QR_expanding_q0.1",
@@ -281,6 +355,10 @@ def get_qr_df():
 
 @st.cache_data(ttl=1800)
 def get_be_df():
+    """Realized Belgian market data: settled day-ahead price plus load,
+    solar, wind, and weather -- everything needed for the context metrics,
+    Reveal & Evaluate's "actual" price, and the Solar/Wind and Weather
+    sub-charts on Review & Adjust."""
     # Already a lean 9-column file -- nothing to trim.
     df = fetch_csv_from_github(GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, "datasets", BE_DATA_FILE, GITHUB_TOKEN)
     df["Date"] = pd.to_datetime(df["Date"])
@@ -288,7 +366,7 @@ def get_be_df():
     return df.sort_values("Date").reset_index(drop=True)
 
 
-init_db()
+init_db()  # creates users/feedback tables in SQLite if they don't exist yet
 
 
 # --------------------------------------------------------------------------
@@ -296,13 +374,16 @@ init_db()
 # --------------------------------------------------------------------------
 
 def get_available_dates(dnn_df):
-    """Dates with a complete 96-slot DNN forecast."""
+    """Dates with a complete 96-slot DNN forecast. A date with fewer rows
+    means the model run for that day is only partially present (e.g. still
+    in progress or truncated) -- excluded so the UI never shows a half-day."""
     counts = dnn_df.groupby("date_only").size()
     return sorted(counts[counts == STEPS_PER_DAY].index)
 
 
 def dnn_forecast(forecast_date, dnn_df):
-    """Returns (values_array, timestamps) for a 96-slot day, or (None, None)."""
+    """Returns (values_array, timestamps) for a 96-slot day, or (None, None)
+    if that date doesn't have a complete forecast."""
     day_rows = dnn_df[dnn_df["date_only"] == forecast_date].sort_values("DateTime")
     if len(day_rows) != STEPS_PER_DAY:
         return None, None
@@ -310,7 +391,9 @@ def dnn_forecast(forecast_date, dnn_df):
 
 
 def dnn_imputed_flags(forecast_date, dnn_df):
-    """Returns the Imputed flag array for the day, or None."""
+    """Returns the per-slot Imputed flag array for the day, or None. All 96
+    values are identical in practice (the flag is set at the day level, just
+    stored per-slot) -- .any() is enough to know if the whole day was imputed."""
     day_rows = dnn_df[dnn_df["date_only"] == forecast_date].sort_values("DateTime")
     if len(day_rows) != STEPS_PER_DAY:
         return None
@@ -336,6 +419,12 @@ def qr_uncertainty_bands(forecast_date, qr_df):
 
 
 def get_calendar_context(forecast_date):
+    """Belgian-holiday and bridge-day context for the day being reviewed --
+    surfaced as metrics on Review & Adjust since both are known drivers of
+    unusual demand/price shapes an expert should factor into their review.
+    A "bridge day" is a working day sandwiched between a holiday and a
+    weekend (Monday after a Tuesday holiday, or Friday before a Monday
+    holiday) -- often behaves like a de facto holiday for demand purposes."""
     be_holidays = holidays.Belgium(years=[forecast_date.year - 1, forecast_date.year, forecast_date.year + 1])
     is_holiday = forecast_date in be_holidays
 
@@ -357,6 +446,12 @@ def get_calendar_context(forecast_date):
 
 def make_chart(timestamps, forecast, inner_lower=None, inner_upper=None,
                 outer_lower=None, outer_upper=None, solar=None, wind=None, renewables_range=None, flagged=None):
+    """The main Review & Adjust chart: DNN forecast line, the two nested QR
+    uncertainty bands (drawn outer-then-inner so the darker inner band sits
+    on top), auto-flagged anomaly markers, and optional solar/wind traces on
+    a secondary y-axis (MW). All inputs are optional except timestamps and
+    forecast -- bands/renewables are simply omitted from the figure if not
+    supplied, rather than erroring."""
     figure = go.Figure()
 
     if outer_lower is not None and outer_upper is not None:
@@ -376,6 +471,8 @@ def make_chart(timestamps, forecast, inner_lower=None, inner_upper=None,
     figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines+markers", name="DNN Forecast",
                                  marker=dict(size=4)))
 
+    # Anomaly markers: slots outside this day's own 5th/95th percentile
+    # (computed by the caller, see the flagging comment in page_review_and_adjust).
     if flagged is not None and np.any(flagged):
         flagged = np.asarray(flagged)
         ts_arr = np.asarray(timestamps)
@@ -411,6 +508,8 @@ def make_chart(timestamps, forecast, inner_lower=None, inner_upper=None,
 
 
 def make_simple_chart(timestamps, values, y_title):
+    """A single-series hourly chart used for the Weather sub-chart
+    (Temperature or Humidity, one at a time, selected via a dropdown)."""
 
     ts_min = pd.Timestamp(np.asarray(timestamps).min())
     ts_max = pd.Timestamp(np.asarray(timestamps).max())
@@ -426,7 +525,9 @@ def make_simple_chart(timestamps, values, y_title):
 
 
 def make_renewables_chart(timestamps, solar=None, wind=None):
-    """Standalone solar + wind chart -- both in MW, so they share one axis."""
+    """Standalone solar + wind chart -- both in MW, so they share one axis
+    (unlike the main chart's secondary axis, this one doesn't need to share
+    space with a EUR/MWh price series)."""
     figure = go.Figure()
     if solar is not None:
         figure.add_trace(go.Scatter(x=timestamps, y=solar, mode="lines+markers", name="Solar (MW)",
@@ -451,16 +552,23 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
 # --------------------------------------------------------------------------
 
 def hash_password(password):
+    """One-way bcrypt hash for storing a new user's password. bcrypt embeds
+    its own random salt in the output, so no separate salt column is needed
+    in the users table -- check_password() below re-derives it from the hash."""
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
     return hashed.decode('utf-8')
 
 
 def check_password(password, hashed_password):
+    """Verifies a login attempt against the stored bcrypt hash."""
     return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 
 def validate_registration(username, email, password):
+    """Self-registration field checks. Returns (is_valid, error_message) --
+    error_message is empty when is_valid is True. Duplicate username/email
+    checks happen separately in auth_screen() since they need a DB lookup."""
     if not username or not email or not password:
         return False, "All fields (Username, Email, and Password) are required."
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
@@ -477,6 +585,15 @@ def validate_registration(username, email, password):
 # --------------------------------------------------------------------------
 
 def page_review_and_adjust():
+    """The core page: load today's (or a selected) forecast, show context and
+    charts, and let an expert review/adjust it 15-minute-slot by slot.
+
+    Behavior differs by who's looking and whether feedback was submitted:
+      - expert, not yet submitted -> editable (see the st.form block below)
+      - expert, already submitted -> read-only, "already submitted" notice
+      - admin (any state)         -> always read-only; admins can view any
+        expert's work but can never submit on their behalf
+    """
     current_user = st.session_state["logged_in_user"]
     current_role = st.session_state["role"]
 
@@ -486,6 +603,7 @@ def page_review_and_adjust():
 
     with st.sidebar:
         if current_role == "admin":
+            # Admins pick which expert's work to view; experts only ever see their own.
             users = load_users()
             expert_list = [u for u, d in users.items() if d["role"] == "expert"]
             expert_id = st.selectbox("Expert ID (Admin View)", expert_list) if expert_list else None
@@ -509,6 +627,7 @@ def page_review_and_adjust():
         st.error(f"No complete DNN forecast for {forecast_date}.")
         return
 
+    # Warn if this day's forecast is a stale carry-forward from a failed model run.
     imputed_flags = dnn_imputed_flags(forecast_date, dnn_df)
     if imputed_flags is not None and imputed_flags.any():
         st.warning(
@@ -521,6 +640,8 @@ def page_review_and_adjust():
     calendar_ctx = get_calendar_context(forecast_date)
     day_rows = be_df.loc[be_df["date_only"] == forecast_date].sort_values("Date")
 
+    # Weather/load context is only available once the actuals feed has caught
+    # up to this date -- e.g. tomorrow's forecast reviewed today won't have it yet.
     if len(day_rows) == STEPS_PER_DAY:
         net_demand = day_rows["Load_BE"] - day_rows["Solar_BE"] - day_rows["Wind_Offshore_BE"] - day_rows["Wind_Onshore_BE"]
         avg_temp = day_rows["temperature_2m"].mean()
@@ -545,7 +666,11 @@ def page_review_and_adjust():
     else:
         st.info("Weather/load context not available for this date.")
 
-     # --- Auto-flag volatile slots (5th/95th percentile of this day's own forecast) ---
+    # --- Auto-flag volatile slots (5th/95th percentile of this day's own forecast) ---
+    # Relative to THIS day's own distribution, not a fixed EUR/MWh threshold --
+    # so a generally-volatile day and a generally-calm day each get flagged
+    # relative to their own baseline, rather than one fixed cutoff favoring
+    # whichever kind of day happens to be more extreme in absolute terms.
     low_threshold = np.percentile(forecast, 5)
     high_threshold = np.percentile(forecast, 95)
     flagged = (forecast <= low_threshold) | (forecast >= high_threshold)
@@ -563,6 +688,11 @@ def page_review_and_adjust():
     if not bands:
         st.caption("QR uncertainty bands unavailable for this date.")
 
+    # Solar & Wind and Weather sit one under the other (not side-by-side):
+    # solar+wind are genuinely linked (their combined dip drives net demand
+    # and price spikes, see net_demand above), so they share one chart by
+    # default; Weather's two series are independent context, so they're a
+    # single dropdown ("Hide" by default) instead of a second always-on chart.
     if context_available:
         with st.container(border=True):
             st.subheader("Solar & Wind - Renewables")
@@ -593,6 +723,11 @@ def page_review_and_adjust():
     hour_of_slot = np.array([pd.Timestamp(ts).hour for ts in timestamps])
     time_label = [pd.Timestamp(ts).strftime("%H:%M") for ts in timestamps]
 
+    # "adjusted" starts as an exact copy of "forecast", pre-rounded to 2
+    # decimals here so it can never drift from the forecast column when
+    # Streamlit's data editor re-serializes the editable column below --
+    # the two columns need to be bit-identical until the expert actually
+    # changes a value.
     working_df = pd.DataFrame({
         "timestamp_slot": timestamps,
         "hour": hour_of_slot,
@@ -603,11 +738,15 @@ def page_review_and_adjust():
         "load_fr": day_rows["Load_FR"].values if context_available else np.nan,
     })
 
-    key = f"{expert_id}_{forecast_date}"
+    key = f"{expert_id}_{forecast_date}"  # one working copy per (expert, date) pair in session state
     already_submitted = has_submitted(expert_id, forecast_date) if expert_id else False
     is_read_only = (current_role == "admin")
 
     if key not in st.session_state:
+        # First time this (expert, date) combo is opened this session: if the
+        # expert has a prior unsubmitted session for this exact date (they
+        # navigated away and came back before hitting Submit), restore their
+        # in-progress edits instead of resetting to the raw forecast.
         log = load_feedback()
         if not log.empty:
             past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
@@ -638,7 +777,7 @@ def page_review_and_adjust():
                         "adjusted": st.column_config.NumberColumn("Adjusted", format="%.2f"),
                         "flagged": st.column_config.CheckboxColumn("Flag", disabled=True),
                     },
-                    disabled=True,
+                    disabled=True,  # the whole grid is non-interactive; per-column disabled flags above are redundant but explicit
                     hide_index=True,
                     key=f"editor_{key}_{h}",
                 )
@@ -654,6 +793,9 @@ def page_review_and_adjust():
         # "Submit feedback" does. This is what fixes both the sluggishness (no
         # more full-page rerun on every single cell edit) and the edits reverting
         # after a rerun (nothing overwrites session_state mid-edit anymore).
+        # NB: no `step` on the Adjusted NumberColumn -- even a small step value
+        # can snap the initial value to a step-aligned grid on first render in
+        # some Streamlit versions, silently rounding away precision.
         with st.form(key=f"feedback_form_{key}"):
             edited_pieces = []
             for h in range(24):
@@ -662,7 +804,7 @@ def page_review_and_adjust():
                 label = f"{h:02d}:00"
                 if n_flagged > 0:
                     label += f"  ⚠️ {n_flagged} flagged"
-                with st.expander(label, expanded=(n_flagged > 0)):
+                with st.expander(label, expanded=(n_flagged > 0)):  # auto-open hours containing a flagged slot
                     edited_hour = st.data_editor(
                         hour_slice[["time_label", "forecast", "adjusted", "flagged"]],
                         column_config={
@@ -683,8 +825,12 @@ def page_review_and_adjust():
             if not expert_id:
                 st.error("Error: No Expert ID found.")
             elif has_submitted(expert_id, forecast_date):
+                # Guards against a double-submit race (e.g. two tabs open on the same date).
                 st.error("A submission already exists for this date. Refresh the page.")
             else:
+                # Recombine the 24 separately-edited hour tables back into one
+                # 96-row frame, then reattach the fields the editor never
+                # touched (timestamp_slot, load_fr) before saving to SQLite.
                 edited = pd.concat(edited_pieces, ignore_index=True)
                 edited["timestamp_slot"] = working["timestamp_slot"].values
                 edited["load_fr"] = working["load_fr"].values
@@ -696,7 +842,7 @@ def page_review_and_adjust():
                 rows["confidence"] = confidence
                 save_feedback(rows)
                 st.success(f"Saved {len(rows)} rows for {expert_id} on {forecast_date}.")
-                st.rerun()
+                st.rerun()  # forces the page back into the read-only branch above
 
 
 # --------------------------------------------------------------------------
@@ -704,13 +850,23 @@ def page_review_and_adjust():
 # --------------------------------------------------------------------------
 
 def get_last_evaluable_ts(now=None):
-    """Never evaluate against a delivery day whose day-ahead auction hasn't settled yet."""
+    """Never evaluate against a delivery day whose day-ahead auction hasn't
+    settled yet. Belgian day-ahead prices for a delivery day are published
+    the day before delivery -- so "today's" prices are already known, but
+    "tomorrow's" (the day currently being forecast, relative to `now`) are
+    not, even if the actuals feed happens to already contain a stale/
+    placeholder value for it. `now` is injectable for testing; production
+    calls always use the default (current time in Europe/Brussels)."""
     now = now if now is not None else pd.Timestamp.now(tz="Europe/Brussels").tz_localize(None)
     tomorrow_start = now.normalize() + pd.Timedelta(days=1)
     return tomorrow_start - pd.Timedelta(minutes=15)
 
 
 def page_reveal_and_evaluate():
+    """Admin-only page: pick one expert's one-day submission and, once that
+    day's prices have settled, compare the original DNN forecast and the
+    expert's adjusted values against the realized price (MAE for each) to
+    see whether the human adjustment helped, hurt, or made no difference."""
     st.title("Reveal & Evaluate")
 
     log = load_feedback()
@@ -737,6 +893,9 @@ def page_reveal_and_evaluate():
         .sort_values("timestamp_slot")
     )
 
+    # Join the saved submission to the realized price by timestamp -- this is
+    # the only place "forecast"/"adjusted" (saved at submission time) meet
+    # "actual" (fetched live), so MAE here always reflects the true settled price.
     actuals = be_df.loc[be_df["date_only"] == forecast_date, ["Date", "Price"]].rename(
         columns={"Date": "timestamp_slot", "Price": "actual"}
     )
@@ -748,7 +907,7 @@ def page_reveal_and_evaluate():
 
     forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
     adjusted_mae = (evaluation["adjusted"] - evaluation["actual"]).abs().mean()
-    confidence_rating = submission["confidence"].iloc[0]
+    confidence_rating = submission["confidence"].iloc[0]  # constant across the day's 96 rows
 
     forecast_metric, adjusted_metric, confidence_metric = st.columns(3)
     forecast_metric.metric("Forecast MAE", f"{forecast_mae:.2f} EUR/MWh")
@@ -768,6 +927,10 @@ def page_reveal_and_evaluate():
 # --------------------------------------------------------------------------
 
 def page_expert_scoreboard():
+    """Admin-only page: aggregates every (expert, date) submission that has
+    a settled actual price into a per-expert leaderboard -- average
+    improvement in MAE, days reviewed, win rate (% of days where the
+    adjustment beat the raw forecast), and average stated confidence."""
     st.title("Expert Scoreboard")
 
     log = load_feedback()
@@ -781,7 +944,7 @@ def page_expert_scoreboard():
     results = []
     for (expert_id, forecast_date), group in log.groupby(["expert_id", "forecast_date"]):
         if pd.Timestamp(forecast_date) > last_evaluable:
-            continue
+            continue  # skip days that haven't settled yet, same rule as Reveal & Evaluate
 
         actuals = be_df.loc[be_df["date_only"] == forecast_date, ["Date", "Price"]].rename(
             columns={"Date": "timestamp_slot", "Price": "actual"}
@@ -798,7 +961,7 @@ def page_expert_scoreboard():
             "forecast_date": forecast_date,
             "forecast_mae": forecast_mae,
             "adjusted_mae": adjusted_mae,
-            "improvement": forecast_mae - adjusted_mae,
+            "improvement": forecast_mae - adjusted_mae,  # positive = the expert helped
             "confidence": group["confidence"].iloc[0],
         })
 
@@ -831,6 +994,10 @@ def page_expert_scoreboard():
 # --------------------------------------------------------------------------
 
 def auth_screen():
+    """Login / self-registration screen, shown instead of any page content
+    when nobody is logged in yet (see main()). Self-registration only offers
+    the "expert" role (EXPERT_ROLES) -- admin accounts must be created
+    directly in the database, not through this UI."""
     st.subheader("Welcome to EPF Expert Review")
 
     auth_mode = st.radio("Choose an option:", ["Log In", "Create Account"], horizontal=True)
@@ -872,26 +1039,14 @@ def auth_screen():
                 save_new_user(username_input, hash_password(new_pass), email_input, new_role)
                 st.success("Account created successfully! You can now switch to the Log In option.")
 
-# def page_embedded_dashboard():
-#     st.title("Margarida's Dashboard")
-#     st.caption(
-#         "This is her dashboard_app.py, unmodified, running as a separate Streamlit "
-#         "process and embedded here via an iframe -- it has its own LEAR/XGB/DNN/"
-#         "Ensemble views and does not share a session or login with this app."
-#     )
-
-#     dashboard_url = st.session_state.get("dashboard_url", "http://localhost:8502")
-#     with st.expander("Embed settings", expanded=False):
-#         dashboard_url = st.text_input(
-#             "Dashboard URL",
-#             value=dashboard_url,
-#             help="Must be running separately: streamlit run dashboard_app.py --server.port 8502",
-#         )
-#         st.session_state["dashboard_url"] = dashboard_url
-
-#     st.iframe(dashboard_url, height=1400)
 
 def page_embedded_dashboard():
+    """Embeds a collaborator's separate model-comparison dashboard (LEAR/
+    XGB/DNN/Ensemble), hosted on its own Hugging Face Space, via an iframe.
+    Deliberately not integrated any deeper than this: it's a different
+    codebase with its own UI/theme, no shared session or login, and no
+    dependency on this app's SQLite database -- if the Space URL ever
+    changes, only this one string needs updating."""
     st.title("Margarida's Dashboard")
     st.caption(
         "Her dashboard, hosted on Hugging Face Spaces and embedded here via an "
@@ -905,6 +1060,10 @@ def page_embedded_dashboard():
 # --------------------------------------------------------------------------
 
 def main():
+    """Entry point. Applies the theme first (so even the login screen is
+    themed), gates everything behind login, then renders the sidebar nav and
+    routes to the selected page. Available pages depend on role -- see the
+    module docstring at the top of this file for what each role can see."""
     apply_theme()
 
     if "logged_in_user" not in st.session_state:
