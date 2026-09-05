@@ -5,14 +5,18 @@ day-ahead electricity price forecasts for the Belgian market.
 WHAT THIS APP IS FOR
 ---------------------
 A neural network (DNN) produces a day-ahead price forecast for Belgium at
-15-minute resolution (96 slots/day). Domain experts review that forecast,
-optionally adjust individual slots they disagree with, flag anomalies, and
-rate their own confidence. Once the delivery day has actually happened and
-its day-ahead auction has settled, admins can reveal the realized price and
-see whether each expert's adjustment improved or worsened accuracy (MAE)
-relative to the raw model forecast -- and aggregate that across experts on a
-scoreboard. The goal is to measure the value of human correction on top of
-the model, not just to collect opinions.
+15-minute resolution (96 slots/day). Domain experts review that forecast
+and adjust it by dragging the curve on a chart -- see draggable_curve, a
+custom React component -- rather than editing 96 individual numbers by
+hand, and rate their own confidence. Once the delivery day has actually
+happened and its day-ahead auction has settled, admins can reveal the
+realized price and see whether each expert's adjustment improved or
+worsened accuracy (MAE) relative to the raw model forecast -- and aggregate
+that across experts on a scoreboard. The goal is to measure the value of
+human correction on top of the model, not just to collect opinions.
+Anomaly flagging is fully automatic (5th/95th percentile of that day's own
+forecast) -- there's no manual per-slot flag override anymore, now that
+editing happens via drag rather than a per-slot table.
 
 ROLES
 -----
@@ -24,19 +28,32 @@ ROLES
 
 DATA SOURCES
 ------------
-Three CSVs are pulled live from a GitHub repo on every page load (cached
+Two CSVs are pulled live from a GitHub repo on every page load (cached
 for 30 min to absorb the daily 10AM/14h refreshes without hammering
-GitHub): the DNN forecast, the QR (quantile regression) uncertainty bands,
-and the realized Belgian market data (price, load, solar, wind, weather).
-See the GITHUB LOADING section below for the exact files/columns.
+GitHub): the DNN forecast and the realized Belgian market data (price,
+load, solar, wind, weather). See the GITHUB LOADING section below for the
+exact files/columns.
+
+UNCERTAINTY BANDS
+------------------
+The chart's uncertainty band is no longer a separate quantile-regression
+(QR) model's output. It's a single 80%-coverage margin, conformal-
+calibrated from the DNN forecast's own settled residuals via ACI (Adaptive
+Conformal Inference) -- see get_aci_margin(). Chosen over the alternative
+(WCP, a single fixed margin from historical residuals) because ACI
+self-adjusts: if recent predictions have been missing the realized price,
+the margin widens on its own; if they've been comfortably covering it, the
+margin relaxes -- no manual recalibration needed after a volatile stretch.
+Ported from a colleague's conformal-prediction notebook.
 
 PAGES
 -----
 1. Review & Adjust       -- the core workflow described above.
-2. Deterministic Forecast Analysis -- a separate, unrelated dashboard built
-   by a collaborator (LEAR/XGB/DNN/Ensemble model comparison), embedded via
-   iframe from its Hugging Face Space. It has its own UI and does not share
-   a session, login, or data pipeline with this app.
+2. Deterministic Forecast Analysis -- DNN forecast vs. actual settled price
+   over the last 14 days. This is the DNN-only slice of a broader LEAR/XGB/
+   DNN/Ensemble comparison a collaborator built separately; rendered
+   natively here with this app's own data pipeline and theme, not embedded
+   from her dashboard.
 3. Reveal & Evaluate (admin only) -- compares one expert's one-day
    submission against the realized price once it has settled.
 4. Expert Scoreboard (admin only) -- aggregates every evaluated submission
@@ -54,6 +71,7 @@ import datetime as dt
 import os
 import io
 import re
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
 
 import bcrypt
@@ -65,6 +83,7 @@ import requests
 from dotenv import load_dotenv
 
 from db import init_db, load_users, save_new_user, save_feedback, load_feedback, has_submitted
+from draggable_curve import draggable_curve
 
 load_dotenv()
 
@@ -87,7 +106,6 @@ GITHUB_REPO = "DAM_Forecast_V4"
 GITHUB_BRANCH = "main"
 
 DNN_FILE = "DNN_forecasts_10AM.csv"     # DNN point forecast + Imputed flag
-QR_FILE = "QR_forecasts_10AM.csv"       # Quantile regression uncertainty bands
 BE_DATA_FILE = "Data_BE_UTC.csv"        # Realized price, load, weather, renewables
 
 STEPS_PER_DAY = 96  # 15-minute resolution: 24h * 4
@@ -230,8 +248,13 @@ def apply_theme():
         }}
         /* The date picker's month/year header lives in a separate baseweb
         wrapper from the day grid itself — cover both, or the header text
-        stays stuck on its default color regardless of mode. */
-        div[data-baseweb="datepicker"], div[data-baseweb="calendar"] {{
+        stays stuck on its default color regardless of mode. Background is
+        applied to every descendant, not just the outer container: unlike
+        color, background-color doesn't cascade down through nested elements
+        -- a sub-element with its own background (e.g. the header bar) keeps
+        it regardless of what the parent container is set to. */
+        div[data-baseweb="datepicker"], div[data-baseweb="calendar"],
+        div[data-baseweb="datepicker"] *, div[data-baseweb="calendar"] * {{
             background-color: {palette['card_bg']} !important;
         }}
         div[data-baseweb="datepicker"] *, div[data-baseweb="calendar"] * {{
@@ -337,21 +360,6 @@ def get_dnn_df():
     return df.sort_values("DateTime").reset_index(drop=True)
 
 
-@st.cache_data(ttl=1800)
-def get_qr_df():
-    """Quantile regression uncertainty bands for the DNN forecast: the
-    10th/90th percentile columns become the chart's "typical range", and the
-    1st/99th percentile columns become the wider "extreme range"."""
-    # The real file has 41 columns (3 calibration windows x 13 quantiles each);
-    # only the expanding-window bands we actually plot are fetched/parsed.
-    cols = ["DateTime", "Imputed", "QR_expanding_q0.01", "QR_expanding_q0.1",
-            "QR_expanding_q0.9", "QR_expanding_q0.99"]
-    df = fetch_csv_from_github(GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, "Forecast", QR_FILE, GITHUB_TOKEN,
-                                usecols=cols)
-    df["DateTime"] = pd.to_datetime(df["DateTime"])
-    df["date_only"] = df["DateTime"].dt.date
-    return df.sort_values("DateTime").reset_index(drop=True)
-
 
 @st.cache_data(ttl=1800)
 def get_be_df():
@@ -400,22 +408,72 @@ def dnn_imputed_flags(forecast_date, dnn_df):
     return day_rows["Imputed"].values
 
 
-def qr_uncertainty_bands(forecast_date, qr_df):
-    """
-    Two nested QR-based bands for forecast_date:
-      inner: q0.1-q0.9 (80% interval)
-      outer: q0.01-q0.99 (98% interval)
-    Returns a dict of four 96-value arrays, or None.
-    """
-    day_rows = qr_df[qr_df["date_only"] == forecast_date].sort_values("DateTime")
-    if len(day_rows) != STEPS_PER_DAY:
+def _forecast_vs_actual(dnn_df, be_df):
+    """Settled (forecast, actual) pairs -- shared prep for both conformal
+    methods below. Never includes the currently-forecast (unsettled) day,
+    same cutoff rule used everywhere else in this app.
+
+    Rows with a missing forecast or actual value are dropped, not just left
+    in as NaN: ACI's residual pool is a fixed-size rolling window, so a
+    single NaN entering it poisons every np.quantile() call downstream
+    until that one value finally slides back out -- including, in the worst
+    case, the very last one, silently returning a NaN margin overall."""
+    last_evaluable = get_last_evaluable_ts()
+    merged = (
+        dnn_df.set_index("DateTime")["DNN_expanding"].rename("forecast")
+        .to_frame()
+        .join(be_df.set_index("Date")["Price"].rename("actual"), how="inner")
+        .sort_index()
+    )
+    merged = merged.loc[merged.index <= last_evaluable]
+    return merged.dropna(subset=["forecast", "actual"])
+
+
+@st.cache_data(ttl=1800)
+def get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30, min_calibration_days=5):
+    """Adaptive Conformal Inference margin, ported from method_ACI() in the
+    conformal-prediction notebook: after an initial calibration window,
+    replays every subsequent settled slot one at a time, self-correcting a
+    target quantile level (alpha_t) based on whether each prediction
+    actually covered the realized price. Returns the margin q as of the END
+    of that replay -- i.e. "right now" -- which is what gets applied to the
+    (unsettled) date currently being reviewed.
+
+    The calibration window is ADAPTIVE, not a hard 30-day requirement: it
+    uses up to `calibration_days` of settled history, but shrinks down to
+    whatever's actually available (as low as `min_calibration_days`) rather
+    than refusing to produce a band at all just because the model hasn't
+    accumulated a full 30 days yet -- relevant right now since the DNN model
+    is newly launched and doesn't have that much history. At least one day
+    is always reserved for the replay itself, or there's nothing to adapt.
+
+    This is genuinely sequential (each step depends on the previous one's
+    updated alpha_t), so it can't be vectorized -- the ttl cache is what
+    keeps it from being recomputed on every page interaction.
+    Returns None only if there's less than min_calibration_days + 1 days of
+    settled history total -- genuinely not enough to do anything with yet."""
+    merged = _forecast_vs_actual(dnn_df, be_df)
+
+    total_days = len(merged) // STEPS_PER_DAY
+    if total_days < min_calibration_days + 1:
         return None
-    return {
-        "inner_lower": day_rows["QR_expanding_q0.1"].values,
-        "inner_upper": day_rows["QR_expanding_q0.9"].values,
-        "outer_lower": day_rows["QR_expanding_q0.01"].values,
-        "outer_upper": day_rows["QR_expanding_q0.99"].values,
-    }
+
+    cal_days = min(calibration_days, total_days - 1)  # leave >=1 day for the replay
+    n_cal = cal_days * STEPS_PER_DAY
+
+    cal, val = merged.iloc[:n_cal], merged.iloc[n_cal:]
+    eps_pool = deque(np.abs(cal["actual"].values - cal["forecast"].values))
+    alpha_t = alpha
+    q = None
+
+    for mu, y in zip(val["forecast"].values, val["actual"].values):
+        q = np.quantile(np.array(eps_pool), 1 - alpha_t, method="linear")
+        covered = (y >= mu - q) and (y <= mu + q)
+        alpha_t = np.clip(alpha_t + gamma * (alpha - (0 if covered else 1)), 1e-6, 1 - 1e-6)
+        eps_pool.append(abs(y - mu))
+        eps_pool.popleft()
+
+    return float(q) if q is not None else None
 
 
 def get_calendar_context(forecast_date):
@@ -444,28 +502,57 @@ def get_calendar_context(forecast_date):
     }
 
 
-def make_chart(timestamps, forecast, inner_lower=None, inner_upper=None,
-                outer_lower=None, outer_upper=None, solar=None, wind=None, renewables_range=None, flagged=None):
-    """The main Review & Adjust chart: DNN forecast line, the two nested QR
-    uncertainty bands (drawn outer-then-inner so the darker inner band sits
-    on top), auto-flagged anomaly markers, and optional solar/wind traces on
-    a secondary y-axis (MW). All inputs are optional except timestamps and
-    forecast -- bands/renewables are simply omitted from the figure if not
-    supplied, rather than erroring."""
+def get_dnn_history_window(dnn_df, be_df, days=14):
+    """DNN forecast vs actual over the last `days` days -- windowed exactly
+    the way Margarida's dashboard_app.py does it in Section 1
+    (get_plot_window_from_forecast + plot_two_series_allow_missing_actual),
+    ported to this app's own dnn_df/be_df rather than her separate
+    LEAR/XGB/Ensemble pipeline. Nothing else from her file (the scatter
+    diagnostics in Section 2, the full-history MAE/rMAE tables in Section 3)
+    is included here -- this is only the Section 1 chart, DNN-only.
+
+    Two behaviors carried over deliberately, since they differ from a more
+    "obvious" implementation:
+      - The window ends at the LATEST available forecast timestamp, not the
+        latest settled day -- so it can include tomorrow's not-yet-settled
+        forecast, same as hers.
+      - Actual is reindexed onto the forecast's own dates rather than
+        inner-joined, so an unsettled day still shows its forecast line
+        (just with a gap where the actual price isn't in yet) instead of
+        disappearing from the window entirely.
+    """
+    forecast = dnn_df.set_index("DateTime")["DNN_expanding"].rename("forecast").sort_index()
+    if forecast.empty:
+        return pd.DataFrame(columns=["DateTime", "forecast", "actual"])
+
+    plot_end = forecast.index.max()
+    plot_start = plot_end - pd.Timedelta(days=days)
+    forecast_window = forecast.loc[(forecast.index >= plot_start) & (forecast.index <= plot_end)]
+
+    actual = be_df.set_index("Date")["Price"].rename("actual")
+    actual = actual[~actual.index.duplicated(keep="last")].sort_index()
+    actual_window = actual.reindex(forecast_window.index)
+
+    history_df = pd.concat([forecast_window, actual_window], axis=1).reset_index()
+    return history_df.rename(columns={"index": "DateTime"})
+
+
+def make_chart(timestamps, forecast, band_lower=None, band_upper=None, band_label="80% interval",
+                solar=None, wind=None, renewables_range=None, flagged=None):
+    """The main Review & Adjust chart: DNN forecast line, one uncertainty
+    band (now from ACI conformal calibration rather than the retired QR
+    model -- see get_aci_margin), auto-flagged anomaly
+    markers, and optional solar/wind traces on a secondary y-axis (MW). All
+    inputs are optional except timestamps and forecast -- the band/
+    renewables are simply omitted from the figure if not supplied, rather
+    than erroring."""
     figure = go.Figure()
 
-    if outer_lower is not None and outer_upper is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=outer_upper, mode="lines", line=dict(width=0), showlegend=False))
+    if band_lower is not None and band_upper is not None:
+        figure.add_trace(go.Scatter(x=timestamps, y=band_upper, mode="lines", line=dict(width=0), showlegend=False))
         figure.add_trace(go.Scatter(
-            x=timestamps, y=outer_lower, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(100,100,255,0.10)", name="Extreme range (1st-99th pct)",
-        ))
-
-    if inner_lower is not None and inner_upper is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=inner_upper, mode="lines", line=dict(width=0), showlegend=False))
-        figure.add_trace(go.Scatter(
-            x=timestamps, y=inner_lower, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(100,100,255,0.25)", name="Typical range (10th-90th pct)",
+            x=timestamps, y=band_lower, mode="lines", line=dict(width=0),
+            fill="tonexty", fillcolor="rgba(100,100,255,0.35)", name=band_label,
         ))
 
     figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines+markers", name="DNN Forecast",
@@ -547,6 +634,53 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
     return themed(figure)
 
 
+def make_comparison_chart(timestamps, forecast, adjusted):
+    """DNN forecast vs. the expert's submitted adjustment, as two overlaid
+    lines. Replaces the old 24-hourly-table read-only view: a single
+    glanceable chart instead of 24 collapsed tables to click through. Only
+    used for already-submitted or admin-viewed submissions -- live editing
+    happens via the draggable_curve widget instead, not this chart."""
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines", name="DNN Forecast",
+                                 line=dict(width=2)))
+    figure.add_trace(go.Scatter(x=timestamps, y=adjusted, mode="lines", name="Expert Adjusted",
+                                 line=dict(width=2, dash="dash")))
+    ts_min = pd.Timestamp(np.asarray(timestamps).min())
+    ts_max = pd.Timestamp(np.asarray(timestamps).max())
+    figure.update_layout(
+        xaxis_title="Time of day",
+        yaxis_title="EUR / MWh",
+        xaxis=dict(tickformat="%H:%M", dtick=3600000, range=[ts_min, ts_max]),
+    )
+    return themed(figure)
+
+
+def make_history_chart(history_df):
+    """Predicted vs actual price over a multi-day window, matching the look
+    of Margarida's dashboard_app.py chart (DNN's terracotta line color, line
+    weights, unified hover, range slider, title style) but kept on our own
+    themed() wrapper instead of her fixed plotly_white template -- 'Actual'
+    uses the theme's own text color instead of her hardcoded near-black, so
+    it stays readable rather than nearly invisible against a dark background."""
+    dark = st.session_state.get("dark_mode", True)
+    palette = get_palette(dark)
+
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=history_df["DateTime"], y=history_df["actual"],
+                                 mode="lines", name="Actual",
+                                 line=dict(width=2.4, color=palette["text"])))
+    figure.add_trace(go.Scatter(x=history_df["DateTime"], y=history_df["forecast"],
+                                 mode="lines", name="DNN forecast",
+                                 line=dict(width=2.2, color="#C97B63")))  # Margarida's DNN color
+    figure.update_layout(
+        title=dict(text="DNN vs Actual", x=0.01, xanchor="left", font=dict(size=20)),
+        xaxis_title="DateTime", yaxis_title="EUR / MWh",
+        hovermode="x unified",
+        xaxis=dict(rangeslider=dict(visible=True)),
+    )
+    return themed(figure)
+
+
 # --------------------------------------------------------------------------
 # AUTH HELPERS
 # --------------------------------------------------------------------------
@@ -598,7 +732,6 @@ def page_review_and_adjust():
     current_role = st.session_state["role"]
 
     dnn_df = get_dnn_df()
-    qr_df = get_qr_df()
     be_df = get_be_df()
 
     with st.sidebar:
@@ -620,6 +753,7 @@ def page_review_and_adjust():
             value=available_dates[-1],
             min_value=available_dates[0],
             max_value=available_dates[-1],
+            key="review_forecast_date",  # explicit key so this survives a page switch
         )
 
     forecast, timestamps = dnn_forecast(forecast_date, dnn_df)
@@ -635,7 +769,12 @@ def page_review_and_adjust():
             "carried forward. Treat this forecast with extra caution."
         )
 
-    bands = qr_uncertainty_bands(forecast_date, qr_df)
+    # Uncertainty band: ACI margin (see get_aci_margin), not the retired QR
+    # model -- a single symmetric margin around the point forecast,
+    # calibrated from settled (forecast, actual) history and continuously
+    # self-adjusted (see the docstring for why ACI specifically).
+    margin = get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30)
+    band_label = "80% interval (ACI)"
 
     calendar_ctx = get_calendar_context(forecast_date)
     day_rows = be_df.loc[be_df["date_only"] == forecast_date].sort_values("Date")
@@ -643,28 +782,39 @@ def page_review_and_adjust():
     # Weather/load context is only available once the actuals feed has caught
     # up to this date -- e.g. tomorrow's forecast reviewed today won't have it yet.
     if len(day_rows) == STEPS_PER_DAY:
-        net_demand = day_rows["Load_BE"] - day_rows["Solar_BE"] - day_rows["Wind_Offshore_BE"] - day_rows["Wind_Onshore_BE"]
+        be_demand = day_rows["Load_BE"].mean()   # gross, matching FR below (not net of solar/wind)
+        avg_load_fr = day_rows["Load_FR"].mean()   # gross -- no Solar_FR/Wind_FR columns exist to net out anyway
         avg_temp = day_rows["temperature_2m"].mean()
         avg_hum = day_rows["relative_humidity_2m"].mean()
-        avg_load_fr = day_rows["Load_FR"].mean()
         context_available = True
     else:
         context_available = False
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Day of week", calendar_ctx["day_of_week"])
     c2.metric("Holiday?", calendar_ctx["holiday_name"] if calendar_ctx["is_holiday"] else "No")
     c3.metric("Bridge day?", "Yes" if calendar_ctx["is_bridge_day"] else "No")
-    if context_available:
-        c4.metric("Avg. net demand BE (MW)", f"{net_demand.mean():,.0f}")
 
-    if context_available:
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Avg. temp (°C)", f"{avg_temp:.1f}")
-        c6.metric("Avg. humidity (%)", f"{avg_hum:.0f}")
-        c7.metric("Avg. French Demand (MW)", f"{avg_load_fr:,.0f}")
-    else:
-        st.info("Weather/load context not available for this date.")
+    # Net demand, French demand, and the temp/humidity averages are single
+    # numbers -- they fit fine in the sidebar. The toggles below control
+    # whether the actual hourly charts render, but the charts themselves
+    # appear on the main page (see after Solar & Wind), not in the sidebar --
+    # the sidebar widget just captures the on/off state.
+    with st.sidebar:
+        st.divider()
+        st.subheader("Day info")
+        if context_available:
+            st.metric("Avg. BE demand (MW)", f"{be_demand:,.0f}")
+            st.metric("Avg. French Demand (MW)", f"{avg_load_fr:,.0f}")
+            st.metric("Avg. temp (°C)", f"{avg_temp:.1f}")
+            st.metric("Avg. humidity (%)", f"{avg_hum:.0f}")
+
+            show_temp_sidebar = st.toggle("Show Temperature plot")
+            show_hum_sidebar = st.toggle("Show Humidity plot")
+        else:
+            st.info("Weather/load context not available for this date.")
+            show_temp_sidebar = False
+            show_hum_sidebar = False
 
     # --- Auto-flag volatile slots (5th/95th percentile of this day's own forecast) ---
     # Relative to THIS day's own distribution, not a fixed EUR/MWh threshold --
@@ -677,22 +827,22 @@ def page_review_and_adjust():
 
     fig = make_chart(
         timestamps, forecast,
-        inner_lower=bands["inner_lower"] if bands else None,
-        inner_upper=bands["inner_upper"] if bands else None,
-        outer_lower=bands["outer_lower"] if bands else None,
-        outer_upper=bands["outer_upper"] if bands else None,
+        band_lower=(forecast - margin) if margin is not None else None,
+        band_upper=(forecast + margin) if margin is not None else None,
+        band_label=band_label,
         flagged=flagged
     )
     st.plotly_chart(fig, width="stretch")
 
-    if not bands:
-        st.caption("QR uncertainty bands unavailable for this date.")
+    if margin is None:
+        st.caption("Not enough settled history yet to calibrate an ACI band for this date.")
+    else:
+        st.caption(f"Current ACI margin: ± {margin:.2f} EUR/MWh")
 
     # Solar & Wind and Weather sit one under the other (not side-by-side):
-    # solar+wind are genuinely linked (their combined dip drives net demand
-    # and price spikes, see net_demand above), so they share one chart by
-    # default; Weather's two series are independent context, so they're a
-    # single dropdown ("Hide" by default) instead of a second always-on chart.
+    # Solar+wind are genuinely linked (their combined dip drives net demand
+    # and price spikes -- Load_BE - Solar_BE - Wind_BE would be net demand),
+    # so they share one chart here.
     if context_available:
         with st.container(border=True):
             st.subheader("Solar & Wind - Renewables")
@@ -710,15 +860,32 @@ def page_review_and_adjust():
                 st.plotly_chart(make_renewables_chart(day_rows["Date"].values, solar=solar_vals, wind=wind_vals),
                                 width="stretch")
 
-        with st.container(border=True):
-            st.subheader("Weather")
-            weather_choice = st.selectbox("Show hourly:", ["Hide", "Temperature", "Humidity"])
-            if weather_choice == "Temperature":
-                st.plotly_chart(make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values,
-                                                "Temperature (°C)"), width="stretch")
-            elif weather_choice == "Humidity":
-                st.plotly_chart(make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values,
-                                                "Humidity (%)"), width="stretch")
+        # Driven by the "Show Temperature/Humidity plot" toggles in the
+        # sidebar's Day info section -- the widgets live there, but the
+        # actual charts render here on the main page, full width, rather
+        # than cramped into the sidebar.
+        if show_temp_sidebar and show_hum_sidebar:
+            wc1, wc2 = st.columns(2)
+            with wc1:
+                st.plotly_chart(
+                    make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values, "Temperature (°C)"),
+                    width="stretch",
+                )
+            with wc2:
+                st.plotly_chart(
+                    make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values, "Humidity (%)"),
+                    width="stretch",
+                )
+        elif show_temp_sidebar:
+            st.plotly_chart(
+                make_simple_chart(day_rows["Date"].values, day_rows["temperature_2m"].values, "Temperature (°C)"),
+                width="stretch",
+            )
+        elif show_hum_sidebar:
+            st.plotly_chart(
+                make_simple_chart(day_rows["Date"].values, day_rows["relative_humidity_2m"].values, "Humidity (%)"),
+                width="stretch",
+            )
 
     hour_of_slot = np.array([pd.Timestamp(ts).hour for ts in timestamps])
     time_label = [pd.Timestamp(ts).strftime("%H:%M") for ts in timestamps]
@@ -760,27 +927,14 @@ def page_review_and_adjust():
     working = st.session_state[key]
 
     if is_read_only or already_submitted:
-        # Read-only view: nothing here can trigger a submission, so there's no
-        # rerun-per-edit cost to avoid -- a plain loop (no form) is fine.
-        for h in range(24):
-            hour_slice = working[working["hour"] == h]
-            n_flagged = int(hour_slice["flagged"].sum())
-            label = f"{h:02d}:00"
-            if n_flagged > 0:
-                label += f"  ⚠️ {n_flagged} flagged"
-            with st.expander(label, expanded=False):
-                st.data_editor(
-                    hour_slice[["time_label", "forecast", "adjusted", "flagged"]],
-                    column_config={
-                        "time_label": st.column_config.TextColumn("Time", disabled=True),
-                        "forecast": st.column_config.NumberColumn("DNN forecast", disabled=True, format="%.2f"),
-                        "adjusted": st.column_config.NumberColumn("Adjusted", format="%.2f"),
-                        "flagged": st.column_config.CheckboxColumn("Flag", disabled=True),
-                    },
-                    disabled=True,  # the whole grid is non-interactive; per-column disabled flags above are redundant but explicit
-                    hide_index=True,
-                    key=f"editor_{key}_{h}",
-                )
+        # Read-only view: a static comparison chart instead of 24 tables --
+        # nothing here is interactive, so there's no per-cell state to manage.
+        st.subheader("Submitted adjustment")
+        st.plotly_chart(
+            make_comparison_chart(working["timestamp_slot"].values, working["forecast"].values,
+                                   working["adjusted"].values),
+            width="stretch",
+        )
 
         if is_read_only:
             st.info(f"Viewing {expert_id}'s submission (read-only — admins cannot submit on behalf of experts).")
@@ -788,38 +942,34 @@ def page_review_and_adjust():
             st.info(f"You've already submitted feedback for {forecast_date}. Submissions are final.")
 
     else:
-        # Editable view: everything lives inside one form, so editing any cell in
-        # any of the 24 hour-tables does NOT trigger a rerun -- only clicking
-        # "Submit feedback" does. This is what fixes both the sluggishness (no
-        # more full-page rerun on every single cell edit) and the edits reverting
-        # after a rerun (nothing overwrites session_state mid-edit anymore).
-        # NB: no `step` on the Adjusted NumberColumn -- even a small step value
-        # can snap the initial value to a step-aligned grid on first render in
-        # some Streamlit versions, silently rounding away precision.
-        with st.form(key=f"feedback_form_{key}"):
-            edited_pieces = []
-            for h in range(24):
-                hour_slice = working[working["hour"] == h]
-                n_flagged = int(hour_slice["flagged"].sum())
-                label = f"{h:02d}:00"
-                if n_flagged > 0:
-                    label += f"  ⚠️ {n_flagged} flagged"
-                with st.expander(label, expanded=(n_flagged > 0)):  # auto-open hours containing a flagged slot
-                    edited_hour = st.data_editor(
-                        hour_slice[["time_label", "forecast", "adjusted", "flagged"]],
-                        column_config={
-                            "time_label": st.column_config.TextColumn("Time", disabled=True),
-                            "forecast": st.column_config.NumberColumn("DNN forecast", disabled=True, format="%.2f"),
-                            "adjusted": st.column_config.NumberColumn("Adjusted", step=0.01, format="%.2f"),
-                            "flagged": st.column_config.CheckboxColumn("Flag"),
-                        },
-                        hide_index=True,
-                        key=f"editor_{key}_{h}",
-                    )
-                    edited_pieces.append(edited_hour)
+        # Editable view: dragging IS the edit -- draggable_curve() updates
+        # st.session_state[key]["adjusted"] and reruns on every drag-release
+        # (see the component's own __init__.py), so `working` is already
+        # current by the time Submit is clicked. No form needed: unlike the
+        # old 24-table version, there's nothing left to batch -- the slider
+        # and button are the only two other widgets on this branch, and
+        # Streamlit reads their current values at click-time regardless.
+        #
+        # Trade-off worth knowing: the old per-slot "Flag" checkbox let an
+        # expert manually flag/unflag individual slots. That's gone now --
+        # `flagged` is purely the auto-detected 5th/95th percentile array
+        # computed above, with no manual override.
+        st.subheader("Drag to adjust")
+        st.caption("Drag any point on the curve below — nearby points within 2 hours shift too.")
+        dragged = draggable_curve(
+            values=working["adjusted"].tolist(),
+            labels=working["time_label"].tolist(),
+            radius=8,
+            height=360,
+            key=f"drag_{key}",
+        )
+        if dragged != working["adjusted"].tolist():
+            working["adjusted"] = dragged
+            st.session_state[key] = working
+            st.rerun()
 
-            confidence = st.slider("How confident are you in these adjustments?", 1, 5, 3)
-            submitted = st.form_submit_button("Submit feedback")
+        confidence = st.slider("How confident are you in these adjustments?", 1, 5, 3)
+        submitted = st.button("Submit feedback")
 
         if submitted:
             if not expert_id:
@@ -828,14 +978,7 @@ def page_review_and_adjust():
                 # Guards against a double-submit race (e.g. two tabs open on the same date).
                 st.error("A submission already exists for this date. Refresh the page.")
             else:
-                # Recombine the 24 separately-edited hour tables back into one
-                # 96-row frame, then reattach the fields the editor never
-                # touched (timestamp_slot, load_fr) before saving to SQLite.
-                edited = pd.concat(edited_pieces, ignore_index=True)
-                edited["timestamp_slot"] = working["timestamp_slot"].values
-                edited["load_fr"] = working["load_fr"].values
-
-                rows = edited.copy()
+                rows = working.copy()
                 rows["expert_id"] = expert_id
                 rows["forecast_date"] = forecast_date
                 rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -1040,20 +1183,25 @@ def auth_screen():
                 st.success("Account created successfully! You can now switch to the Log In option.")
 
 
-def page_embedded_dashboard():
-    """Embeds a collaborator's separate model-comparison dashboard (LEAR/
-    XGB/DNN/Ensemble), hosted on its own Hugging Face Space, via an iframe.
-    Deliberately not integrated any deeper than this: it's a different
-    codebase with its own UI/theme, no shared session or login, and no
-    dependency on this app's SQLite database -- if the Space URL ever
-    changes, only this one string needs updating."""
-    st.title("Margarida's Dashboard")
-    st.caption(
-        "Her dashboard, hosted on Hugging Face Spaces and embedded here via an "
-        "iframe -- it has its own LEAR/XGB/DNN/Ensemble views and does not share "
-        "a session or login with this app."
-    )
-    st.iframe("https://eds-lab-dam-price-forecast.hf.space/", height=1400)
+def page_dnn_history():
+    """DNN-only slice of Margarida's Section 1 chart (forecast vs actual,
+    last N days) -- natively rendered in this app's own theme using
+    dnn_df/be_df, no iframe, no external dependency on her Hugging Face
+    Space. Deliberately just the chart: her Section 2 (scatter diagnostics)
+    and Section 3 (full-history MAE/rMAE tables) aren't part of this page."""
+    st.title("Deterministic Forecast Analysis — DNN")
+    st.caption("DNN forecast vs. actual settled price, last 14 days.")
+
+    dnn_df = get_dnn_df()
+    be_df = get_be_df()
+
+    history_df = get_dnn_history_window(dnn_df, be_df, days=14)
+
+    if history_df.empty:
+        st.info("No DNN forecast data available yet.")
+        return
+
+    st.plotly_chart(make_history_chart(history_df), width="stretch")
 
 # --------------------------------------------------------------------------
 # MAIN
@@ -1095,7 +1243,7 @@ def main():
     elif page == "Expert Scoreboard":
         page_expert_scoreboard()
     elif page == "Deterministic Forecast Analysis":
-        page_embedded_dashboard()
+        page_dnn_history()
 
 
 if __name__ == "__main__":
