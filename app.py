@@ -58,12 +58,28 @@ PAGES
    submission against the realized price once it has settled.
 4. Expert Scoreboard (admin only) -- aggregates every evaluated submission
    across all experts into a leaderboard (avg. improvement, win rate, etc.).
+5. Survey Results (admin only) -- the post-submission reflection survey
+   (see render_submission_survey()): usability, comprehension of the
+   forecast/uncertainty band, and relevance of the added weather/renewables
+   context, shown once right after each successful submission -- plus a
+   one-time EPF-experience profile per user. Built for a research question
+   about whether/how human review improves EPF forecasts; joinable against
+   the "feedback" table's MAE evaluation on (username, forecast_date).
 
 THEMING
 -------
 A dark/light toggle in the sidebar injects CSS (see apply_theme()) and
 drives a matching Plotly template (see themed()) so charts and UI chrome
 never fall out of sync with each other.
+
+NAMING
+------
+The visible UI title says "RLHF" -- shorthand for the research framing
+behind this whole app: measuring whether human feedback improves a model's
+output, the same underlying idea as RLHF for language models, just applied
+here to electricity price forecasting instead. The module/variable names
+throughout the code still say "EPF Expert Review" since that's the more
+literal description of what the tool actually does day to day.
 """
 
 import streamlit as st
@@ -72,7 +88,7 @@ import os
 import io
 import re
 from collections import deque
-from datetime import date, datetime, timedelta, timezone
+from datetime import timedelta
 
 import bcrypt
 import holidays
@@ -82,7 +98,12 @@ import plotly.graph_objects as go
 import requests
 from dotenv import load_dotenv
 
-from db import init_db, load_users, save_new_user, save_feedback, load_feedback, has_submitted
+from db import (
+    init_db, load_users, save_new_user, save_feedback, load_feedback, has_submitted,
+    get_user_profile, save_user_profile, load_all_user_profiles,
+    save_submission_survey, load_submission_survey,
+    get_onboarding_status, save_onboarding_status,
+)
 from draggable_curve import draggable_curve
 
 load_dotenv()
@@ -90,7 +111,7 @@ load_dotenv()
 # Run the Streamlit Dashboard using 'streamlit run app.py'
 
 st.set_page_config(page_title='EPF Expert Review', layout='wide')
-st.title('Electricity Price Forecasting -  Expert Review')
+st.title('Electricity Price Forecasting - RLHF')
 
 
 # --------------------------------------------------------------------------
@@ -275,6 +296,24 @@ def apply_theme():
         [data-testid="stExpander"] svg, [data-testid="stSidebar"] svg {{
             fill: {palette['text']} !important;
             stroke: {palette['text']} !important;
+        }}
+        /* st.toggle's "on" track color, verified against the actual rendered
+        DOM (Streamlit auto-generates these Emotion class names -- no stable
+        data-testid/role/aria attribute exists for this element, unlike
+        every other rule in this stylesheet). Tied to this Streamlit
+        version's build; if a future `pip install --upgrade streamlit`
+        reverts this to red, re-inspect a toggled-on switch in devtools and
+        swap in whatever class names it shows then. */
+        .st-emotion-cache-1bkesb7.ew2p8o5 {{
+            background-color: {palette['accent']} !important;
+            border-color: {palette['accent']} !important;
+        }}
+        /* st.radio's selected-dot color (the sidebar page selector) -- same
+        auto-generated-class situation as the toggle rule above, verified
+        the same way. Re-inspect if a Streamlit upgrade reverts this. */
+        .st-emotion-cache-he5m1v.etak9234 {{
+            background-color: {palette['accent']} !important;
+            border-color: {palette['accent']} !important;
         }}
         </style>
         """,
@@ -537,63 +576,6 @@ def get_dnn_history_window(dnn_df, be_df, days=14):
     return history_df.rename(columns={"index": "DateTime"})
 
 
-def make_chart(timestamps, forecast, band_lower=None, band_upper=None, band_label="80% interval",
-                solar=None, wind=None, renewables_range=None, flagged=None):
-    """The main Review & Adjust chart: DNN forecast line, one uncertainty
-    band (now from ACI conformal calibration rather than the retired QR
-    model -- see get_aci_margin), auto-flagged anomaly
-    markers, and optional solar/wind traces on a secondary y-axis (MW). All
-    inputs are optional except timestamps and forecast -- the band/
-    renewables are simply omitted from the figure if not supplied, rather
-    than erroring."""
-    figure = go.Figure()
-
-    if band_lower is not None and band_upper is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=band_upper, mode="lines", line=dict(width=0), showlegend=False))
-        figure.add_trace(go.Scatter(
-            x=timestamps, y=band_lower, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(100,100,255,0.35)", name=band_label,
-        ))
-
-    figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines+markers", name="DNN Forecast",
-                                 marker=dict(size=4)))
-
-    # Anomaly markers: slots outside this day's own 5th/95th percentile
-    # (computed by the caller, see the flagging comment in page_review_and_adjust).
-    if flagged is not None and np.any(flagged):
-        flagged = np.asarray(flagged)
-        ts_arr = np.asarray(timestamps)
-        f_arr = np.asarray(forecast)
-        figure.add_trace(go.Scatter(
-            x=ts_arr[flagged], y=f_arr[flagged], mode="markers", name="Flagged (5th/95th pct)",
-            marker=dict(size=4, symbol="diamond", color="orange", line=dict(color="white", width=1)),
-        ))
-
-    if solar is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=solar, mode="lines", name="Solar (MW)", yaxis="y2",
-                                     line=dict(color="orange")))
-    if wind is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=wind, mode="lines", name="Wind (MW)", yaxis="y2",
-                                     line=dict(color="green")))
-
-    ts_min = pd.Timestamp(np.asarray(timestamps).min())
-    ts_max = pd.Timestamp(np.asarray(timestamps).max())
-
-    layout_kwargs = dict(
-        xaxis_title="Time of day",
-        yaxis_title="EUR / MWh",
-        xaxis=dict(tickformat="%H:%M", dtick=3600000, range=[ts_min, ts_max]),  # one labeled tick per hour
-    )
-    if solar is not None or wind is not None:
-        y2_settings = dict(title="MW", overlaying="y", side="right")
-        if renewables_range is not None:
-            y2_settings["range"] = renewables_range
-        layout_kwargs["yaxis2"] = y2_settings
-
-    figure.update_layout(**layout_kwargs)
-    return themed(figure)
-
-
 def make_simple_chart(timestamps, values, y_title):
     """A single-series hourly chart used for the Weather sub-chart
     (Temperature or Humidity, one at a time, selected via a dropdown)."""
@@ -617,11 +599,17 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
     space with a EUR/MWh price series)."""
     figure = go.Figure()
     if solar is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=solar, mode="lines+markers", name="Solar (MW)",
-                                     marker=dict(size=4), line=dict(color="orange")))
+        figure.add_trace(go.Scatter(
+            x=timestamps, y=solar, mode="lines", name="Solar (MW)",
+            line=dict(color="#eab308", width=2.5),
+            fill="tozeroy", fillcolor="rgba(234,179,8,0.15)",
+        ))
     if wind is not None:
-        figure.add_trace(go.Scatter(x=timestamps, y=wind, mode="lines+markers", name="Wind total (MW)",
-                                     marker=dict(size=4), line=dict(color="green")))
+        figure.add_trace(go.Scatter(
+            x=timestamps, y=wind, mode="lines", name="Wind total (MW)",
+            line=dict(color="#14b8a6", width=2.5),
+            fill="tozeroy", fillcolor="rgba(20,184,166,0.15)",
+        ))
     ts_min = pd.Timestamp(np.asarray(timestamps).min())
     ts_max = pd.Timestamp(np.asarray(timestamps).max())
     figure.update_layout(
@@ -629,30 +617,93 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
         yaxis_title="MW",
         xaxis=dict(tickformat="%H:%M", dtick=3600000, range=[ts_min, ts_max]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(t=60),
+        margin=dict(t=50, b=40, l=50, r=20),
+        height=280, 
+        hovermode="x unified",
     )
     return themed(figure)
 
 
-def make_comparison_chart(timestamps, forecast, adjusted):
-    """DNN forecast vs. the expert's submitted adjustment, as two overlaid
-    lines. Replaces the old 24-hourly-table read-only view: a single
-    glanceable chart instead of 24 collapsed tables to click through. Only
-    used for already-submitted or admin-viewed submissions -- live editing
-    happens via the draggable_curve widget instead, not this chart."""
+def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_upper=None, flagged=None):
+    """Forecast vs. adjusted, with the uncertainty band and flagged anomaly
+    markers -- the read-only counterpart to the draggable_curve widget used
+    for live editing. Shows the same information (band, flags, forecast
+    reference, adjustment) as that widget, just as a static Plotly chart,
+    for admin-viewed or already-submitted work where dragging doesn't apply.
+    Replaces the old separate make_chart() (band + flags, no adjustment)
+    and the original bare-bones make_comparison_chart (forecast vs adjusted,
+    no band/flags) -- one function covering what both used to, now that
+    make_chart's only call site (the live top-of-page chart) has been
+    replaced entirely by draggable_curve."""
     figure = go.Figure()
+
+    if band_lower is not None and band_upper is not None:
+        figure.add_trace(go.Scatter(x=timestamps, y=band_upper, mode="lines", line=dict(width=0), showlegend=False))
+        figure.add_trace(go.Scatter(
+            x=timestamps, y=band_lower, mode="lines", line=dict(width=0),
+            fill="tonexty", fillcolor="rgba(100,100,255,0.35)", name="80% interval (ACI)",
+        ))
+
     figure.add_trace(go.Scatter(x=timestamps, y=forecast, mode="lines", name="DNN Forecast",
-                                 line=dict(width=2)))
-    figure.add_trace(go.Scatter(x=timestamps, y=adjusted, mode="lines", name="Expert Adjusted",
                                  line=dict(width=2, dash="dash")))
+    figure.add_trace(go.Scatter(x=timestamps, y=adjusted, mode="lines+markers", name="Expert Adjusted",
+                                 marker=dict(size=4)))
+
+    # Anomaly markers: slots outside this day's own 5th/95th percentile
+    # (computed by the caller, see the flagging comment in page_review_and_adjust).
+    if flagged is not None and np.any(flagged):
+        flagged = np.asarray(flagged)
+        ts_arr = np.asarray(timestamps)
+        adj_arr = np.asarray(adjusted)
+        figure.add_trace(go.Scatter(
+            x=ts_arr[flagged], y=adj_arr[flagged], mode="markers", name="Flagged (5th/95th pct)",
+            marker=dict(size=6, symbol="diamond", color="orange", line=dict(color="white", width=1)),
+        ))
+
     ts_min = pd.Timestamp(np.asarray(timestamps).min())
     ts_max = pd.Timestamp(np.asarray(timestamps).max())
     figure.update_layout(
         xaxis_title="Time of day",
         yaxis_title="EUR / MWh",
         xaxis=dict(tickformat="%H:%M", dtick=3600000, range=[ts_min, ts_max]),
+        showlegend=False,  # replaced by render_chart_legend() below -- see its docstring
     )
     return themed(figure)
+
+
+def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
+    """Custom HTML legend, styled to match draggable_curve's own hand-built
+    legend exactly -- same colors, same swatch shapes, same layout -- so the
+    visual language stays consistent whether the chart above is the
+    interactive drag widget (while editing) or the static Plotly chart
+    (read-only). Plotly's own native legend is turned off in
+    make_comparison_chart() in favor of this, since a Plotly-native legend
+    can't be restyled to look identical to hand-built HTML/CSS -- this is
+    two independently-maintained pieces of code (Python here, TypeScript in
+    DraggableCurve.tsx) that happen to produce matching pixels, not one
+    shared implementation; keep both in sync by hand if either changes."""
+    dark = st.session_state.get("dark_mode", True)
+    palette = get_palette(dark)
+
+    items = ['<span style="display:flex;align-items:center;gap:5px;">'
+             '<span style="width:14px;height:3px;background:#6366f1;display:inline-block;border-radius:1px;"></span>'
+             'Adjusted</span>']
+    if show_forecast:
+        items.append('<span style="display:flex;align-items:center;gap:5px;">'
+                      f'<span style="width:14px;height:0;border-top:2px dashed {palette["text_muted"]};display:inline-block;opacity:0.6;"></span>'
+                      'DNN Forecast</span>')
+    if show_band:
+        items.append('<span style="display:flex;align-items:center;gap:5px;">'
+                      '<span style="width:14px;height:10px;background:rgba(100,100,255,0.35);display:inline-block;border-radius:2px;"></span>'
+                      '80% interval (ACI)</span>')
+    if show_flagged:
+        items.append('<span style="display:flex;align-items:center;gap:5px;">'
+                      '<span style="width:9px;height:9px;background:#f59e0b;border-radius:50%;display:inline-block;"></span>'
+                      'Flagged (5th/95th pct)</span>')
+
+    html = (f'<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:12px;'
+            f'color:{palette["text_muted"]};margin-top:6px;">' + "".join(items) + '</div>')
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def make_history_chart(history_df):
@@ -718,6 +769,68 @@ def validate_registration(username, email, password):
 # PAGE 1: REVIEW & ADJUST
 # --------------------------------------------------------------------------
 
+def render_submission_survey(expert_id, forecast_date, survey_key):
+    """One-time reflection survey shown immediately after a successful
+    submission -- the natural "moment of success" to ask, rather than an
+    always-available, easy-to-ignore sidebar widget. Built for a specific
+    research question (does human review/correction actually help EPF
+    forecasts, and does the tool's design support that): usability and
+    comprehension matter because a low score on either casts doubt on
+    whether an adjustment (and its self-reported confidence) reflects
+    genuine judgment rather than confusion; context-relevance directly
+    tests whether the extra weather/renewables data in this app helped
+    calibration or was just decoration. Experience level is asked ONCE per
+    user (see get_user_profile) since it's a stable trait, not something
+    that changes submission to submission -- a moderator variable for
+    later analysis, not a per-session measure.
+
+    Skippable by design, not mandatory: trapping the user with a required
+    form would hurt response quality more than a missed response costs --
+    worth noting as a limitation if response rate becomes relevant in the
+    writeup."""
+    st.divider()
+    st.subheader("Quick reflection")
+    st.caption("A few questions for the research behind this tool -- not about the forecast itself.")
+
+    existing_experience = get_user_profile(expert_id)
+    ask_experience = existing_experience is None
+
+    with st.form(key=f"survey_form_{survey_key}"):
+        if ask_experience:
+            experience = st.select_slider(
+                "How would you describe your experience with electricity price forecasting?",
+                options=["None", "Some familiarity", "Experienced", "Expert"],
+                value="Some familiarity",
+            )
+
+        usability = st.slider("How easy was it to use this application for this task?", 1, 5, 3)
+        comprehension = st.slider(
+            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 1, 5, 3
+        )
+        context_relevance = st.slider(
+            "How useful was the additional context (temperature, humidity, solar/wind) for making your adjustment?",
+            1, 5, 3,
+        )
+        comment = st.text_area("Anything else you'd like to share about this session? (optional)", height=80)
+
+        submit_col, skip_col = st.columns(2)
+        submit_survey = submit_col.form_submit_button("Submit reflection")
+        skip_survey = skip_col.form_submit_button("Skip")
+
+    if submit_survey:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        if ask_experience:
+            save_user_profile(expert_id, experience, now)
+        save_submission_survey(expert_id, forecast_date, usability, comprehension, context_relevance,
+                                comment.strip(), now)
+        st.session_state[survey_key] = False
+        render_success_banner("Thanks for the reflection!")
+        st.rerun()
+    elif skip_survey:
+        st.session_state[survey_key] = False
+        st.rerun()
+
+
 def page_review_and_adjust():
     """The core page: load today's (or a selected) forecast, show context and
     charts, and let an expert review/adjust it 15-minute-slot by slot.
@@ -774,16 +887,25 @@ def page_review_and_adjust():
     # calibrated from settled (forecast, actual) history and continuously
     # self-adjusted (see the docstring for why ACI specifically).
     margin = get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30)
-    band_label = "80% interval (ACI)"
 
     calendar_ctx = get_calendar_context(forecast_date)
     day_rows = be_df.loc[be_df["date_only"] == forecast_date].sort_values("Date")
 
     # Weather/load context is only available once the actuals feed has caught
     # up to this date -- e.g. tomorrow's forecast reviewed today won't have it yet.
+    # French demand is deliberately NOT surfaced here: France's demand sits on a
+    # completely different scale from Belgium's, so a side-by-side comparison
+    # wasn't actually useful context for judging the Belgian forecast.
+    #
+    # NET (residual) demand, not gross: price is set by the marginal generator
+    # covering demand AFTER renewables (near-zero marginal cost, don't set
+    # price) are already subtracted -- net demand tracks price movements in a
+    # way gross demand doesn't (a high-gross/high-wind day can be unremarkable
+    # for price; a modest-gross/no-wind day can spike). Also keeps this number
+    # consistent with why Solar & Wind stay visible by default below.
     if len(day_rows) == STEPS_PER_DAY:
-        be_demand = day_rows["Load_BE"].mean()   # gross, matching FR below (not net of solar/wind)
-        avg_load_fr = day_rows["Load_FR"].mean()   # gross -- no Solar_FR/Wind_FR columns exist to net out anyway
+        wind_total_day = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
+        net_demand = (day_rows["Load_BE"] - day_rows["Solar_BE"] - wind_total_day).mean()
         avg_temp = day_rows["temperature_2m"].mean()
         avg_hum = day_rows["relative_humidity_2m"].mean()
         context_available = True
@@ -791,21 +913,24 @@ def page_review_and_adjust():
         context_available = False
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Day of week", calendar_ctx["day_of_week"])
+    c1.metric("Day of the week", calendar_ctx["day_of_week"])
     c2.metric("Holiday?", calendar_ctx["holiday_name"] if calendar_ctx["is_holiday"] else "No")
     c3.metric("Bridge day?", "Yes" if calendar_ctx["is_bridge_day"] else "No")
 
-    # Net demand, French demand, and the temp/humidity averages are single
-    # numbers -- they fit fine in the sidebar. The toggles below control
-    # whether the actual hourly charts render, but the charts themselves
-    # appear on the main page (see after Solar & Wind), not in the sidebar --
-    # the sidebar widget just captures the on/off state.
+    # Net demand and the temp/humidity averages are single numbers -- they
+    # fit fine in the sidebar. The toggles below control whether the actual
+    # hourly charts render, but the charts themselves appear on the main
+    # page (see after Solar & Wind), not in the sidebar -- the sidebar
+    # widget just captures the on/off state.
     with st.sidebar:
         st.divider()
         st.subheader("Day info")
         if context_available:
-            st.metric("Avg. BE demand (MW)", f"{be_demand:,.0f}")
-            st.metric("Avg. French Demand (MW)", f"{avg_load_fr:,.0f}")
+            st.metric(
+                "Avg. Net BE demand (MW)", f"{net_demand:,.0f}",
+                help="Gross demand minus solar and wind generation -- the portion of demand "
+                     "that has to be covered by other (price-setting) generation.",
+            )
             st.metric("Avg. temp (°C)", f"{avg_temp:.1f}")
             st.metric("Avg. humidity (%)", f"{avg_hum:.0f}")
 
@@ -816,6 +941,26 @@ def page_review_and_adjust():
             show_temp_sidebar = False
             show_hum_sidebar = False
 
+    with st.expander("What am I looking at?"):
+        st.write(
+            "This is the forecast chart for the chosen day. The :blue[shaded band] is an 80% "
+            "confidence interval. Points shown in :orange[orange] are ones the model itself flagged as "
+            "unusual for this particular day. The dashed line is the original, unadjusted "
+            "forecast, useful for seeing how far an adjustment has drifted from it. Points "
+            "can be dragged up or down accordingly."
+        )
+        st.write(
+            "In the left side panel, the second page: :red[***Deterministic Forecast Analysis***] shows the DNN forecast against the "
+            "actual prices across the last 14 days. Further down, there is relevant day "
+            "information, as well as two slider buttons for displaying the temperature and "
+            "humidity plots."
+        )
+        st.write(
+            ":green[Renewables (Solar, Wind)] during the given day are plotted underneath the "
+            "draggable forecast using their respective slider button. "
+            "Indicate the confidence level in your results before submission."
+        )
+
     # --- Auto-flag volatile slots (5th/95th percentile of this day's own forecast) ---
     # Relative to THIS day's own distribution, not a fixed EUR/MWh threshold --
     # so a generally-volatile day and a generally-calm day each get flagged
@@ -825,19 +970,94 @@ def page_review_and_adjust():
     high_threshold = np.percentile(forecast, 95)
     flagged = (forecast <= low_threshold) | (forecast >= high_threshold)
 
-    fig = make_chart(
-        timestamps, forecast,
-        band_lower=(forecast - margin) if margin is not None else None,
-        band_upper=(forecast + margin) if margin is not None else None,
-        band_label=band_label,
-        flagged=flagged
-    )
-    st.plotly_chart(fig, width="stretch")
+    hour_of_slot = np.array([pd.Timestamp(ts).hour for ts in timestamps])
+    time_label = [pd.Timestamp(ts).strftime("%H:%M") for ts in timestamps]
+
+    # "adjusted" starts as an exact copy of "forecast", pre-rounded to 2
+    # decimals here so it can never drift from the forecast column when the
+    # drag component or Streamlit's own widgets re-serialize it -- the two
+    # columns need to be bit-identical until the expert actually changes a
+    # value. Moved up here (before the chart, not after it) so the chart
+    # itself -- draggable or static -- can be built from `working` and show
+    # the adjustment alongside the forecast, band, and flags all at once.
+    working_df = pd.DataFrame({
+        "timestamp_slot": timestamps,
+        "hour": hour_of_slot,
+        "time_label": time_label,
+        "forecast": np.round(forecast, 2),
+        "adjusted": np.round(forecast, 2),
+        "flagged": flagged,
+        "load_fr": day_rows["Load_FR"].values if context_available else np.nan,
+    })
+
+    key = f"{expert_id}_{forecast_date}"  # one working copy per (expert, date) pair in session state
+    survey_key = f"survey_pending_{key}"  # set True right after a fresh submission, see below
+    already_submitted = has_submitted(expert_id, forecast_date) if expert_id else False
+    is_read_only = (current_role == "admin")
+
+    if key not in st.session_state:
+        # First time this (expert, date) combo is opened this session: if the
+        # expert has a prior unsubmitted session for this exact date (they
+        # navigated away and came back before hitting Submit), restore their
+        # in-progress edits instead of resetting to the raw forecast.
+        log = load_feedback()
+        if not log.empty:
+            past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
+            if not past_sub.empty:
+                past_sub = past_sub.tail(STEPS_PER_DAY).sort_values("timestamp_slot")
+                if len(past_sub) == STEPS_PER_DAY:
+                    working_df["adjusted"] = past_sub["adjusted"].values
+                    working_df["flagged"] = past_sub["flagged"].values
+        st.session_state[key] = working_df
+
+    working = st.session_state[key]
+
+    # The band belongs to the ORIGINAL forecast, not the adjusted line --
+    # ACI's margin is calibrated against the model's own historical error,
+    # so it doesn't move just because an expert drags a point.
+    band_lower = (working["forecast"] - margin).tolist() if margin is not None else None
+    band_upper = (working["forecast"] + margin).tolist() if margin is not None else None
+
+    # --- The main chart: draggable while editing, static once there's
+    # nothing left to drag. Both show the same information together --
+    # forecast, adjustment, uncertainty band, flagged points -- so editing
+    # happens directly on "the real chart" instead of a separate, stripped-
+    # down widget underneath a static reference chart.
+    if is_read_only or already_submitted:
+        st.plotly_chart(
+            make_comparison_chart(
+                working["timestamp_slot"].values, working["forecast"].values, working["adjusted"].values,
+                band_lower=band_lower, band_upper=band_upper, flagged=working["flagged"].values,
+            ),
+            width="stretch",
+        )
+        render_chart_legend(
+            show_forecast=True,  # make_comparison_chart always plots forecast, unlike draggable_curve where it's optional
+            show_band=band_lower is not None,
+            show_flagged=bool(np.any(working["flagged"].values)),
+        )
+    else:
+        dragged = draggable_curve(
+            values=working["adjusted"].tolist(),
+            labels=working["time_label"].tolist(),
+            radius=8,
+            height=420,
+            key=f"drag_{key}",
+            forecast=working["forecast"].tolist(),
+            band_lower=band_lower,
+            band_upper=band_upper,
+            flagged=working["flagged"].tolist(),
+        )
+        if dragged != working["adjusted"].tolist():
+            working["adjusted"] = dragged
+            st.session_state[key] = working
+            st.rerun()
 
     if margin is None:
         st.caption("Not enough settled history yet to calibrate an ACI band for this date.")
     else:
         st.caption(f"Current ACI margin: ± {margin:.2f} EUR/MWh")
+
 
     # Solar & Wind and Weather sit one under the other (not side-by-side):
     # Solar+wind are genuinely linked (their combined dip drives net demand
@@ -847,8 +1067,8 @@ def page_review_and_adjust():
         with st.container(border=True):
             st.subheader("Solar & Wind - Renewables")
             sc1, sc2 = st.columns(2)
-            show_solar = sc1.toggle("Solar", value=True)
-            show_wind = sc2.toggle("Wind", value=True)
+            show_solar = sc1.toggle("☀️ Solar", value=True)
+            show_wind = sc2.toggle("💨 Wind", value=True)
 
             wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
             solar_vals = day_rows["Solar_BE"].values if show_solar else None
@@ -887,89 +1107,31 @@ def page_review_and_adjust():
                 width="stretch",
             )
 
-    hour_of_slot = np.array([pd.Timestamp(ts).hour for ts in timestamps])
-    time_label = [pd.Timestamp(ts).strftime("%H:%M") for ts in timestamps]
-
-    # "adjusted" starts as an exact copy of "forecast", pre-rounded to 2
-    # decimals here so it can never drift from the forecast column when
-    # Streamlit's data editor re-serializes the editable column below --
-    # the two columns need to be bit-identical until the expert actually
-    # changes a value.
-    working_df = pd.DataFrame({
-        "timestamp_slot": timestamps,
-        "hour": hour_of_slot,
-        "time_label": time_label,
-        "forecast": np.round(forecast, 2),
-        "adjusted": np.round(forecast, 2),
-        "flagged": flagged,
-        "load_fr": day_rows["Load_FR"].values if context_available else np.nan,
-    })
-
-    key = f"{expert_id}_{forecast_date}"  # one working copy per (expert, date) pair in session state
-    already_submitted = has_submitted(expert_id, forecast_date) if expert_id else False
-    is_read_only = (current_role == "admin")
-
-    if key not in st.session_state:
-        # First time this (expert, date) combo is opened this session: if the
-        # expert has a prior unsubmitted session for this exact date (they
-        # navigated away and came back before hitting Submit), restore their
-        # in-progress edits instead of resetting to the raw forecast.
-        log = load_feedback()
-        if not log.empty:
-            past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
-            if not past_sub.empty:
-                past_sub = past_sub.tail(STEPS_PER_DAY).sort_values("timestamp_slot")
-                if len(past_sub) == STEPS_PER_DAY:
-                    working_df["adjusted"] = past_sub["adjusted"].values
-                    working_df["flagged"] = past_sub["flagged"].values
-        st.session_state[key] = working_df
-
-    working = st.session_state[key]
-
+    # --- Footer: role/status-specific. The survey appears exactly once,
+    # right after a fresh submission -- afterward it's the normal info
+    # message on every subsequent visit to this same (expert, date) page. ---
     if is_read_only or already_submitted:
-        # Read-only view: a static comparison chart instead of 24 tables --
-        # nothing here is interactive, so there's no per-cell state to manage.
-        st.subheader("Submitted adjustment")
-        st.plotly_chart(
-            make_comparison_chart(working["timestamp_slot"].values, working["forecast"].values,
-                                   working["adjusted"].values),
-            width="stretch",
-        )
-
         if is_read_only:
             st.info(f"Viewing {expert_id}'s submission (read-only — admins cannot submit on behalf of experts).")
+        elif st.session_state.get(survey_key, False):
+            render_submission_survey(expert_id, forecast_date, survey_key)
         else:
             st.info(f"You've already submitted feedback for {forecast_date}. Submissions are final.")
-
     else:
-        # Editable view: dragging IS the edit -- draggable_curve() updates
-        # st.session_state[key]["adjusted"] and reruns on every drag-release
-        # (see the component's own __init__.py), so `working` is already
-        # current by the time Submit is clicked. No form needed: unlike the
-        # old 24-table version, there's nothing left to batch -- the slider
-        # and button are the only two other widgets on this branch, and
-        # Streamlit reads their current values at click-time regardless.
+        # No form needed: unlike the old 24-table version, there's nothing
+        # left to batch -- dragging already updates st.session_state[key]
+        # and reruns on every drag-release (see draggable_curve's own
+        # __init__.py), so `working` is already current by the time Submit
+        # is clicked, and the slider/button are the only other widgets here.
         #
         # Trade-off worth knowing: the old per-slot "Flag" checkbox let an
         # expert manually flag/unflag individual slots. That's gone now --
         # `flagged` is purely the auto-detected 5th/95th percentile array
         # computed above, with no manual override.
-        st.subheader("Drag to adjust")
-        st.caption("Drag any point on the curve below — nearby points within 2 hours shift too.")
-        dragged = draggable_curve(
-            values=working["adjusted"].tolist(),
-            labels=working["time_label"].tolist(),
-            radius=8,
-            height=360,
-            key=f"drag_{key}",
-        )
-        if dragged != working["adjusted"].tolist():
-            working["adjusted"] = dragged
-            st.session_state[key] = working
-            st.rerun()
-
-        confidence = st.slider("How confident are you in these adjustments?", 1, 5, 3)
-        submitted = st.button("Submit feedback")
+        with st.container(border=True):
+            st.subheader("Your confidence")
+            confidence = st.slider("How confident are you in these adjustments? (1-no confidence, 5-highest confidence)", 1, 5, 3)
+            submitted = st.button("Submit feedback")
 
         if submitted:
             if not expert_id:
@@ -984,7 +1146,8 @@ def page_review_and_adjust():
                 rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 rows["confidence"] = confidence
                 save_feedback(rows)
-                st.success(f"Saved {len(rows)} rows for {expert_id} on {forecast_date}.")
+                st.session_state[survey_key] = True  # triggers render_submission_survey() on the next render
+                render_success_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.")
                 st.rerun()  # forces the page back into the read-only branch above
 
 
@@ -1048,9 +1211,23 @@ def page_reveal_and_evaluate():
         st.info("No realized prices available yet for this date.")
         return
 
+    # Some slots can have a matched timestamp but a missing/NaN price -- a
+    # real upstream data gap (e.g. around when the model's pipeline stopped
+    # updating), not a bug in the submission or the merge itself. Drop those
+    # rather than letting them silently turn both MAE numbers into NaN.
+    n_missing_actual = int(evaluation["actual"].isna().sum())
+    evaluation = evaluation.dropna(subset=["actual"])
+
+    if evaluation.empty:
+        st.info(f"Realized prices for {forecast_date} are missing from the data feed -- nothing to evaluate yet.")
+        return
+
     forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
     adjusted_mae = (evaluation["adjusted"] - evaluation["actual"]).abs().mean()
     confidence_rating = submission["confidence"].iloc[0]  # constant across the day's 96 rows
+
+    if n_missing_actual > 0:
+        st.caption(f"⚠️ {n_missing_actual} of {STEPS_PER_DAY} slots had a missing realized price and were excluded from these MAE numbers.")
 
     forecast_metric, adjusted_metric, confidence_metric = st.columns(3)
     forecast_metric.metric("Forecast MAE", f"{forecast_mae:.2f} EUR/MWh")
@@ -1096,6 +1273,14 @@ def page_expert_scoreboard():
         if evaluation.empty:
             continue
 
+        # Same upstream data-gap issue as Reveal & Evaluate: drop slots with
+        # a missing actual price rather than letting a NaN day silently
+        # poison this expert's entire avg_improvement/win_rate aggregation
+        # below, not just this one row.
+        evaluation = evaluation.dropna(subset=["actual"])
+        if evaluation.empty:
+            continue
+
         forecast_mae = (evaluation["forecast"] - evaluation["actual"]).abs().mean()
         adjusted_mae = (evaluation["adjusted"] - evaluation["actual"]).abs().mean()
 
@@ -1130,6 +1315,134 @@ def page_expert_scoreboard():
     scoreboard["avg_confidence"] = scoreboard["avg_confidence"].round(1)
 
     st.dataframe(scoreboard, hide_index=True)
+
+
+# --------------------------------------------------------------------------
+# ONBOARDING (research disclaimer + step-by-step tutorial, shown once)
+# --------------------------------------------------------------------------
+
+ONBOARDING_STEPS = [
+    {
+        "title": "Before you continue",
+        "kind": "consent",
+    },
+    {
+        "title": "What this app is for",
+        "body": (
+            "You'll review a day-ahead electricity price forecast produced by a "
+            "neural network, and adjust it if you disagree with part of it. This is "
+            "part of a research study measuring whether human review actually "
+            "improves electricity price forecasts."
+        ),
+    },
+    {
+        "title": "Reading the chart",
+        "body": (
+            "The main chart shows the model's forecast as a line, with a shaded band "
+            "around it -- an 80% confidence interval, meaning the real price is "
+            "expected to land inside it about 80% of the time. Points shown in orange "
+            "are ones the model itself flagged as unusual for that particular day (5th/95th percentile)."
+        ),
+    },
+    {
+        "title": "Adjusting the forecast",
+        "body": (
+            "To adjust the forecast, drag any point on the curve up or down. Nearby "
+            "points shift too, so you're reshaping a stretch of the curve rather than "
+            "creating a single spike."
+        ),
+    },
+    {
+        "title": "Using the extra context",
+        "body": (
+            "Below the chart you'll find extra information: demand, temperature, "
+            "humidity, solar and wind output. That might help you judge whether the "
+            "model's forecast makes sense for that particular day."
+        ),
+    },
+    {
+        "title": "Submitting",
+        "body": (
+            "Once you're happy with your adjustment, rate how confident you are and "
+            "click Submit. Submissions are final. There's no editing afterward. "
+            "Right after submitting, you'll be asked a few short reflection "
+            "questions. That's the actual research data this study is collecting, "
+            "so please answer honestly."
+        ),
+    },
+]
+
+
+def render_onboarding(username):
+    """Blocks access to the rest of the app until a user has (a) acknowledged
+    the research-purposes disclaimer and (b) stepped through a short
+    walkthrough of how the app works. Shown once per user -- persisted to
+    the database (onboarding_status), not just session state, so it's a
+    true one-time gate rather than something re-shown every login. Applies
+    to every role, including admins, so the disclaimer is unambiguously
+    seen by everyone rather than assuming admins already know it."""
+    step_idx_key = f"onboarding_step_idx_{username}"
+    if step_idx_key not in st.session_state:
+        st.session_state[step_idx_key] = 0
+
+    step_idx = st.session_state[step_idx_key]
+    step = ONBOARDING_STEPS[step_idx]
+    total = len(ONBOARDING_STEPS)
+
+    st.title(step["title"])
+    st.caption(f"Step {step_idx + 1} of {total}")
+
+    consent_given = True
+    if step.get("kind") == "consent":
+        st.warning(
+            "**This application is intended for research purposes.** Your forecast "
+            "adjustments, confidence ratings, and survey responses will be used in an "
+            "academic study on human-in-the-loop electricity price forecasting. No "
+            "real trading or operational decisions should be based on this tool."
+        )
+        consent_given = st.checkbox(
+            "I understand this application is intended for research purposes.",
+            key=f"onboarding_consent_{username}",
+        )
+    else:
+        st.write(step["body"])
+
+    back_col, next_col = st.columns(2)
+    if step_idx > 0:
+        if back_col.button("Back", key=f"onboarding_back_{username}_{step_idx}"):
+            st.session_state[step_idx_key] -= 1
+            st.rerun()
+
+    is_last = step_idx == total - 1
+    next_label = "Get started" if is_last else "Next"
+    if next_col.button(next_label, disabled=not consent_given, key=f"onboarding_next_{username}_{step_idx}"):
+        if is_last:
+            save_onboarding_status(username, True, True, dt.datetime.now(dt.timezone.utc).isoformat())
+            del st.session_state[step_idx_key]
+        else:
+            st.session_state[step_idx_key] += 1
+        st.rerun()
+
+
+def render_success_banner(message):
+    """A guaranteed-green success banner for the two "you did it" moments
+    (forecast submitted, reflection submitted). Built as plain HTML rather
+    than st.success(): apply_theme()'s blanket [data-testid="stAlert"]
+    override -- needed to theme info/warning/error consistently across
+    dark/light mode -- also flattens Streamlit's own built-in green styling
+    for success messages specifically, since success/info/warning/error all
+    share that same testid. Rather than gamble on an unverified per-type
+    selector, this sidesteps the ambiguity entirely with its own fixed,
+    theme-aware green."""
+    dark = st.session_state.get("dark_mode", True)
+    text_color = "#4ade80" if dark else "#15803d"
+    bg_color = "rgba(34,197,94,0.15)" if dark else "rgba(34,197,94,0.12)"
+    st.markdown(
+        f'<div style="background-color:{bg_color};border:1px solid #22c55e;'
+        f'border-radius:8px;padding:0.75rem 1rem;color:{text_color};font-weight:500;">'
+        f'✅ {message}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1203,6 +1516,48 @@ def page_dnn_history():
 
     st.plotly_chart(make_history_chart(history_df), width="stretch")
 
+
+def page_survey_results():
+    """Admin-only page: the post-submission reflection survey data (see
+    render_submission_survey() on Review & Adjust) plus the one-time
+    experience-level profile per user. Built for exporting into whatever
+    actual statistical analysis the research paper needs -- this page shows
+    summaries and lets you download the raw data, it deliberately doesn't
+    try to compute correlations or run the analysis itself."""
+    st.title("Survey Results")
+
+    survey_df = load_submission_survey()
+    if survey_df.empty:
+        st.info("No survey responses submitted yet.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Responses", len(survey_df))
+    c2.metric("Avg. usability", f"{survey_df['usability_rating'].mean():.1f} / 5")
+    c3.metric("Avg. comprehension", f"{survey_df['comprehension_rating'].mean():.1f} / 5")
+    c4.metric("Avg. context relevance", f"{survey_df['context_relevance_rating'].mean():.1f} / 5")
+
+    st.subheader("Raw responses")
+    st.caption("One row per submission this was answered for -- joinable against the feedback "
+               "table's MAE evaluation on (username, forecast_date).")
+    st.dataframe(survey_df, hide_index=True, width="stretch")
+    st.download_button(
+        "Download as CSV",
+        survey_df.to_csv(index=False).encode("utf-8"),
+        file_name="submission_survey.csv",
+        mime="text/csv",
+    )
+
+    st.subheader("Experience profile per expert")
+    st.caption("Answered once per user, on their first submission -- a moderator variable, "
+               "not something that changes day to day.")
+    profiles_df = load_all_user_profiles()
+    if profiles_df.empty:
+        st.info("No experience-level responses yet.")
+    else:
+        st.dataframe(profiles_df, hide_index=True, width="stretch")
+
+
 # --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
@@ -1221,6 +1576,11 @@ def main():
     current_user = st.session_state["logged_in_user"]
     current_role = st.session_state["role"]
 
+    consented, completed_tutorial = get_onboarding_status(current_user)
+    if not (consented and completed_tutorial):
+        render_onboarding(current_user)
+        return
+
     with st.sidebar:
         st.write(f"Logged in as: **{current_user}** ({current_role})")
         if st.button("Log Out"):
@@ -1230,7 +1590,8 @@ def main():
         st.divider()
 
         if current_role == "admin":
-            pages = ["Review & Adjust","Deterministic Forecast Analysis", "Reveal & Evaluate", "Expert Scoreboard"]
+            pages = ["Review & Adjust", "Deterministic Forecast Analysis", "Reveal & Evaluate",
+                     "Expert Scoreboard", "Survey Results"]
         else:
             pages = ["Review & Adjust", "Deterministic Forecast Analysis"]
 
@@ -1244,6 +1605,8 @@ def main():
         page_expert_scoreboard()
     elif page == "Deterministic Forecast Analysis":
         page_dnn_history()
+    elif page == "Survey Results":
+        page_survey_results()
 
 
 if __name__ == "__main__":

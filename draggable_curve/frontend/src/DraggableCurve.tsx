@@ -6,6 +6,10 @@ interface Args {
   labels: string[];
   radius: number;
   height: number;
+  forecast?: number[];
+  band_lower?: number[];
+  band_upper?: number[];
+  flagged?: boolean[];
 }
 
 const PAD_LEFT = 48;
@@ -26,7 +30,9 @@ function falloffWeight(distance: number, radius: number): number {
 
 const DraggableCurve: React.FC<ComponentProps> = (props) => {
   const args = props.args as Args;
-  const { labels, radius, height } = args;
+  const { labels, radius, height, forecast, flagged } = args;
+  const bandLower = args.band_lower;
+  const bandUpper = args.band_upper;
 
   // `values` is the live, possibly-mid-drag array driving the chart.
   // `baseValuesRef` is a frozen snapshot taken at the moment a drag starts,
@@ -58,7 +64,7 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
   }, []);
 
   useEffect(() => {
-    Streamlit.setFrameHeight(height + PAD_TOP + PAD_BOTTOM + 24);
+    Streamlit.setFrameHeight(height + PAD_TOP + PAD_BOTTOM + 52);
   }, [height]);
 
   // Axis range is frozen for the duration of an active drag, recomputed
@@ -74,13 +80,17 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
     if (isDragging) {
       return axisRangeRef.current;
     }
-    const lo = Math.min(...values);
-    const hi = Math.max(...values);
+    const allValues = [...values];
+    if (bandLower) allValues.push(...bandLower);
+    if (bandUpper) allValues.push(...bandUpper);
+    if (forecast) allValues.push(...forecast);
+    const lo = Math.min(...allValues);
+    const hi = Math.max(...allValues);
     const pad = (hi - lo) * 0.15 || 1;
     const range: [number, number] = [lo - pad, hi + pad];
     axisRangeRef.current = range;
     return range;
-  }, [values, isDragging]);
+  }, [values, bandLower, bandUpper, forecast, isDragging]);
 
   const plotWidth = width - PAD_LEFT - PAD_RIGHT;
   const plotHeight = height - PAD_TOP - PAD_BOTTOM;
@@ -186,6 +196,19 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
     return values.map((v, i) => `${i === 0 ? "M" : "L"}${xForIndex(i)},${yForValue(v)}`).join(" ");
   }, [values, xForIndex, yForValue]);
 
+  const bandPath = useMemo(() => {
+  if (!bandLower || !bandUpper || bandLower.length !== n || bandUpper.length !== n) return null;
+  let d = "";
+  for (let i = 0; i < n; i++) d += `${i === 0 ? "M" : "L"}${xForIndex(i)},${yForValue(bandUpper[i])} `;
+  for (let i = n - 1; i >= 0; i--) d += `L${xForIndex(i)},${yForValue(bandLower[i])} `;
+  return d + "Z";
+  }, [bandLower, bandUpper, n, xForIndex, yForValue]);
+
+  const forecastPath = useMemo(() => {
+    if (!forecast || forecast.length !== n) return null;
+    return forecast.map((v, i) => `${i === 0 ? "M" : "L"}${xForIndex(i)},${yForValue(v)}`).join(" ");
+  }, [forecast, n, xForIndex, yForValue]);
+
   const labelStep = Math.max(1, Math.round(n / 8)); // ~8 x-axis labels regardless of n
 
   return (
@@ -237,6 +260,14 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
           ) : null
         )}
 
+        {bandPath && (
+          <path d={bandPath} fill="rgba(100,100,255,0.35)" stroke="none" style={{ pointerEvents: "none" }} />
+        )}
+        {forecastPath && (
+          <path d={forecastPath} fill="none" stroke="var(--text-color, #888)" strokeWidth={1.5}
+                strokeDasharray="5 4" opacity={0.6} style={{ pointerEvents: "none" }} />
+        )}
+
         {/* the curve itself */}
         <path d={linePath} fill="none" stroke="#6366f1" strokeWidth={2.5} />
 
@@ -247,7 +278,7 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
             cx={xForIndex(i)}
             cy={yForValue(v)}
             r={dragIndexRef.current === i ? 6 : 4}
-            fill="#6366f1"
+            fill={flagged && flagged[i] ? "#f59e0b" : "#6366f1"}
             stroke="white"
             strokeWidth={1}
             style={{ cursor: "ns-resize" }}
@@ -256,6 +287,33 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
       </svg>
       <div style={{ fontSize: 12, color: "var(--text-color, #888)", marginTop: 4 }}>
         Drag any point to adjust it — nearby points within {radius} slots shift too.
+      </div>
+      {/* Real legend with color swatches, matching what Plotly's native
+        legend showed before this chart became the draggable_curve widget --
+        only lists entries for whatever was actually supplied as args. */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 14, fontSize: 12, color: "var(--text-color, #888)", marginTop: 6 }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <span style={{ width: 14, height: 3, background: "#6366f1", display: "inline-block", borderRadius: 1 }} />
+          Adjusted
+        </span>
+        {forecastPath && (
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 14, height: 0, borderTop: "2px dashed var(--text-color, #888)", display: "inline-block", opacity: 0.6 }} />
+            DNN Forecast
+          </span>
+        )}
+        {bandPath && (
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 14, height: 10, background: "rgba(100,100,255,0.35)", display: "inline-block", borderRadius: 2 }} />
+            80% interval (ACI)
+          </span>
+        )}
+        {flagged && (
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 9, height: 9, background: "#f59e0b", borderRadius: "50%", display: "inline-block" }} />
+            Flagged (5th/95th pct)
+          </span>
+        )}
       </div>
     </div>
   );

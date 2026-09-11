@@ -33,6 +33,50 @@ def init_db():
             FOREIGN KEY (expert_id) REFERENCES users(username)
         )
     """)
+    # One-time profile per user -- asked only once (see get_user_profile),
+    # since domain experience is a stable trait, not something that changes
+    # submission to submission. A moderator variable for the research
+    # question: does prior EPF experience change how much the tool helps.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_profile (
+            username TEXT PRIMARY KEY,
+            epf_experience TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+    """)
+    # Reflection survey shown right after a successful submission (the
+    # "moment of success" -- see render_submission_survey() in app.py), not
+    # a generic anytime feedback box. Linked to (username, forecast_date) so
+    # it can be joined against the "feedback" table's MAE evaluation later --
+    # correlating self-reported comprehension/relevance against objective
+    # forecast-improvement is the actual research question this supports.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS submission_survey (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            forecast_date TEXT NOT NULL,
+            usability_rating INTEGER NOT NULL,
+            comprehension_rating INTEGER NOT NULL,
+            context_relevance_rating INTEGER NOT NULL,
+            comment TEXT,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+    """)
+    # One-time gate per user: research-purposes disclaimer (consented) and
+    # the step-by-step tutorial (completed_tutorial). Persisted here, not
+    # just session state, so it's a genuine one-time acknowledgment --
+    # never re-shown on later logins once both are true.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS onboarding_status (
+            username TEXT PRIMARY KEY,
+            consented INTEGER NOT NULL,
+            completed_tutorial INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -90,3 +134,76 @@ def has_submitted(expert_id, forecast_date):
     count = cursor.fetchone()[0]
     conn.close()
     return count > 0
+
+def get_user_profile(username):
+    """Returns the stored epf_experience string for this user, or None if
+    they've never answered it -- used to decide whether to ask the
+    experience question again (skip if already answered once)."""
+    conn = get_connection()
+    cursor = conn.execute("SELECT epf_experience FROM user_profile WHERE username = ?", (username,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def save_user_profile(username, epf_experience, timestamp):
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO user_profile (username, epf_experience, timestamp) VALUES (?, ?, ?)",
+        (username, epf_experience, timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+def load_all_user_profiles():
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM user_profile", conn)
+    conn.close()
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+def save_submission_survey(username, forecast_date, usability_rating, comprehension_rating,
+                            context_relevance_rating, comment, timestamp):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO submission_survey
+            (username, forecast_date, usability_rating, comprehension_rating, context_relevance_rating, comment, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (username, str(forecast_date), int(usability_rating), int(comprehension_rating),
+         int(context_relevance_rating), comment, timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+def load_submission_survey():
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM submission_survey ORDER BY timestamp DESC", conn)
+    conn.close()
+    if not df.empty:
+        df["forecast_date"] = pd.to_datetime(df["forecast_date"]).dt.date
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+def get_onboarding_status(username):
+    """Returns (consented, completed_tutorial) as booleans, or (False, False)
+    if this user has never started onboarding."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "SELECT consented, completed_tutorial FROM onboarding_status WHERE username = ?", (username,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return False, False
+    return bool(row[0]), bool(row[1])
+
+def save_onboarding_status(username, consented, completed_tutorial, timestamp):
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO onboarding_status (username, consented, completed_tutorial, timestamp) VALUES (?, ?, ?, ?)",
+        (username, int(consented), int(completed_tutorial), timestamp),
+    )
+    conn.commit()
+    conn.close()

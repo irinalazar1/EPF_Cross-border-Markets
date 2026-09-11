@@ -29,8 +29,8 @@ else:
     _build_dir = os.path.join(_parent_dir, "frontend", "dist")
     _component_func = components.declare_component("draggable_curve", path=_build_dir)
 
-
-def draggable_curve(values, labels=None, radius=8, height=360, key=None):
+def draggable_curve(values, labels=None, radius=8, height=360, key=None,
+                     forecast=None, band_lower=None, band_upper=None, flagged=None):
     """Interactive draggable curve. Drag any point to adjust it; every point
     within `radius` slots on either side shifts too, by a linearly-decaying
     fraction of the same delta, so dragging deforms a smooth stretch of the
@@ -68,6 +68,10 @@ def draggable_curve(values, labels=None, radius=8, height=360, key=None):
         labels=list(labels),
         radius=int(radius),
         height=int(height),
+        forecast=[float(v) for v in forecast] if forecast is not None else None,
+        band_lower=[float(v) for v in band_lower] if band_lower is not None else None,
+        band_upper=[float(v) for v in band_upper] if band_upper is not None else None,
+        flagged=[bool(v) for v in flagged] if flagged is not None else None,
         key=key,
         default=values,
     )
