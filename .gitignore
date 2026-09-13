@@ -13,7 +13,6 @@ __pycache__/
 
 # Other
 *.DS_Store
-epf_dashboard.db
 visualizing_data.ipynb
 draggable_curve/frontend/node_modules/
 draggable_curve/__pycache__/

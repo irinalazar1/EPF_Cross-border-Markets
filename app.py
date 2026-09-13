@@ -1431,7 +1431,7 @@ def page_survey_results():
     c4.metric("Avg. context relevance", f"{survey_df['context_relevance_rating'].mean():.1f} / 5")
 
     st.subheader("Raw responses")
-    st.caption("One row per submission this was answered for -- joinable against the feedback "
+    st.caption("One row per submission this was answered for - joinable against the feedback "
                "table's MAE evaluation on (username, forecast_date).")
     st.dataframe(survey_df, hide_index=True, width="stretch")
     st.download_button(
@@ -1442,7 +1442,7 @@ def page_survey_results():
     )
 
     st.subheader("Experience profile per expert")
-    st.caption("Answered once per user, on their first submission -- a moderator variable, "
+    st.caption("Answered once per user, on their first submission - a moderator variable, "
                "not something that changes day to day.")
     profiles_df = load_all_user_profiles()
     if profiles_df.empty:

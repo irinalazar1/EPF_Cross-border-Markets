@@ -14,7 +14,7 @@ interface Args {
 
 const PAD_LEFT = 48;
 const PAD_RIGHT = 16;
-const PAD_TOP = 16;
+const PAD_TOP = 26; // room for the "EUR / MWh" unit label above the topmost gridline
 const PAD_BOTTOM = 32;
 
 /**
@@ -42,6 +42,11 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
   const baseValuesRef = useRef<number[]>(args.values);
   const dragIndexRef = useRef<number | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // Which point to show a value tooltip for. Drag takes priority over
+  // hover (set below via `activeIndex`) since during a drag the pointer
+  // may not be exactly over the point being moved.
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
   const width = Math.max(props.width || 700, 300);
   const n = values.length;
@@ -192,6 +197,23 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
     };
   }, []); // mount once -- handlers are always invoked via the refs above, so they never go stale
 
+  // Hover tracking is separate from drag tracking: this only updates
+  // `hoverIndex` (real React state, so it re-renders) while idle, letting
+  // someone scan values before touching anything. During an active drag,
+  // `dragIndexRef` already identifies the relevant point every render (via
+  // the setValues() call in applyDrag), so hover state is simply ignored
+  // in favor of it -- see `activeIndex` below.
+  const handleSvgMouseMove = (clientX: number) => {
+    if (dragIndexRef.current !== null) return;
+    const { x } = getSvgPoint(clientX, 0);
+    setHoverIndex(indexForX(x));
+  };
+  const handleSvgMouseLeave = () => {
+    if (dragIndexRef.current === null) setHoverIndex(null);
+  };
+
+  const activeIndex = dragIndexRef.current !== null ? dragIndexRef.current : hoverIndex;
+
   const linePath = useMemo(() => {
     return values.map((v, i) => `${i === 0 ? "M" : "L"}${xForIndex(i)},${yForValue(v)}`).join(" ");
   }, [values, xForIndex, yForValue]);
@@ -209,7 +231,53 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
     return forecast.map((v, i) => `${i === 0 ? "M" : "L"}${xForIndex(i)},${yForValue(v)}`).join(" ");
   }, [forecast, n, xForIndex, yForValue]);
 
-  const labelStep = Math.max(1, Math.round(n / 8)); // ~8 x-axis labels regardless of n
+  // Hour-aligned x-axis labels, not an arbitrary "every n/8th point" step:
+  // labels only ever land on an exact hour (":00"), and the hour STEP
+  // (every 1h/2h/3h/4h) adapts to available width so labels never overlap
+  // -- shows all 24 hours when there's room, thins out gracefully on a
+  // narrow/mobile chart instead of a fixed density regardless of size.
+  const hourLabelStep = useMemo(() => {
+    const pxIfEveryHour = plotWidth / 24;
+    if (pxIfEveryHour >= 24) return 1;
+    if (pxIfEveryHour >= 12) return 2;
+    if (pxIfEveryHour >= 8) return 3;
+    return 4;
+  }, [plotWidth]);
+
+  const isHourLabel = useCallback(
+    (i: number) => {
+      const parts = labels[i]?.split(":");
+      if (!parts || parts.length < 2) return false;
+      const hh = Number(parts[0]);
+      const mm = Number(parts[1]);
+      return mm === 0 && hh % hourLabelStep === 0;
+    },
+    [labels, hourLabelStep]
+  );
+
+  // Tooltip box placement: anchored near the active point, but flipped to
+  // stay inside the chart when that point is close to an edge, rather than
+  // running text off the side (near x=0) or over the axis (near the top).
+  const tooltip = useMemo(() => {
+    if (activeIndex === null) return null;
+    const v = values[activeIndex];
+    const x = xForIndex(activeIndex);
+    const y = yForValue(v);
+    const boxWidth = 108;
+    const boxHeight = 20;
+    const anchorLeft = x + boxWidth + 10 > width - PAD_RIGHT;
+    const boxX = anchorLeft ? x - boxWidth - 10 : x + 10;
+    const wantsAbove = y - boxHeight - 8 >= PAD_TOP;
+    const boxY = wantsAbove ? y - boxHeight - 8 : y + 8;
+
+    const original = forecast && forecast.length === n ? forecast[activeIndex] : undefined;
+    const showOriginal = original !== undefined && Math.abs(original - v) > 0.05;
+    const text = showOriginal
+      ? `${labels[activeIndex]} — ${v.toFixed(1)} (was ${original.toFixed(1)})`
+      : `${labels[activeIndex]} — ${v.toFixed(1)}`;
+
+    return { boxX, boxY, boxWidth, boxHeight, text };
+  }, [activeIndex, values, xForIndex, yForValue, width, forecast, n, labels]);
 
   return (
     <div>
@@ -219,6 +287,8 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
         height={height}
         style={{ touchAction: "none", cursor: "ns-resize", display: "block" }}
         onMouseDown={(e) => handlePointerDown(e.clientX, e.clientY)}
+        onMouseMove={(e) => handleSvgMouseMove(e.clientX)}
+        onMouseLeave={handleSvgMouseLeave}
         onTouchStart={(e) => {
           if (e.touches.length > 0) handlePointerDown(e.touches[0].clientX, e.touches[0].clientY);
         }}
@@ -238,6 +308,9 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
         />
 
         {/* y-axis gridlines + labels */}
+        <text x={PAD_LEFT + 4} y={14} fontSize={10} textAnchor="start" fill="var(--text-color, #888)" opacity={0.7}>
+          EUR / MWh
+        </text>
         {[0, 0.25, 0.5, 0.75, 1].map((t) => {
           const v = yMin + t * (yMax - yMin);
           const y = yForValue(v);
@@ -251,9 +324,9 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
           );
         })}
 
-        {/* x-axis labels */}
+        {/* x-axis labels: one per exact hour, thinned adaptively -- see hourLabelStep */}
         {values.map((_, i) =>
-          i % labelStep === 0 ? (
+          isHourLabel(i) ? (
             <text key={i} x={xForIndex(i)} y={height - PAD_BOTTOM + 16} fontSize={10} textAnchor="middle" fill="var(--text-color, #888)">
               {labels[i]}
             </text>
@@ -271,22 +344,52 @@ const DraggableCurve: React.FC<ComponentProps> = (props) => {
         {/* the curve itself */}
         <path d={linePath} fill="none" stroke="#6366f1" strokeWidth={2.5} />
 
-        {/* draggable point handles */}
+        {/* draggable point handles -- enlarged on hover too, not just while dragging */}
         {values.map((v, i) => (
           <circle
             key={i}
             cx={xForIndex(i)}
             cy={yForValue(v)}
-            r={dragIndexRef.current === i ? 6 : 4}
+            r={activeIndex === i ? 6 : 4}
             fill={flagged && flagged[i] ? "#f59e0b" : "#6366f1"}
             stroke="white"
             strokeWidth={1}
             style={{ cursor: "ns-resize" }}
           />
         ))}
+
+        {/* Value/time tooltip for whichever point is hovered or being
+           dragged -- this is the actual fix for "how do experts know what
+           they're adjusting": without it, only 5 sparse y-axis gridline
+           values were visible, with no way to read an individual point. */}
+        {tooltip && (
+          <g style={{ pointerEvents: "none" }}>
+            <rect
+              x={tooltip.boxX}
+              y={tooltip.boxY}
+              width={tooltip.boxWidth}
+              height={tooltip.boxHeight}
+              rx={4}
+              fill="var(--background-color, #1c222b)"
+              stroke="#6366f1"
+              strokeWidth={1}
+              opacity={0.95}
+            />
+            <text
+              x={tooltip.boxX + tooltip.boxWidth / 2}
+              y={tooltip.boxY + tooltip.boxHeight / 2}
+              fontSize={11}
+              textAnchor="middle"
+              dominantBaseline="middle"
+              fill="var(--text-color, #eee)"
+            >
+              {tooltip.text}
+            </text>
+          </g>
+        )}
       </svg>
       <div style={{ fontSize: 12, color: "var(--text-color, #888)", marginTop: 4 }}>
-        Drag any point to adjust it — nearby points within {radius} slots shift too.
+        Drag any point to adjust it — nearby points within {radius} slots shift too. Hover a point to see its exact time and value.
       </div>
       {/* Real legend with color swatches, matching what Plotly's native
         legend showed before this chart became the draggable_curve widget --
