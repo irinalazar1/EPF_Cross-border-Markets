@@ -17,6 +17,5 @@ epf_dashboard.db
 visualizing_data.ipynb
 draggable_curve/frontend/node_modules/
 draggable_curve/__pycache__/
-draggable_curve/frontend/dist/
 error_handling.py
 
