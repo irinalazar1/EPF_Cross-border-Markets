@@ -1,85 +1,50 @@
 """
-EPF Expert Review -- a Streamlit dashboard for human-in-the-loop review of
-day-ahead electricity price forecasts for the Belgian market.
+EPF Expert Review (RLHF) -- Streamlit dashboard for human-in-the-loop
+review of day-ahead electricity price forecasts for the Belgian market.
+"RLHF" in the UI title reflects the research framing (does human feedback
+improve a model's output); code/variable names still say "EPF Expert
+Review" as the literal description.
 
-WHAT THIS APP IS FOR
----------------------
-A neural network (DNN) produces a day-ahead price forecast for Belgium at
-15-minute resolution (96 slots/day). Domain experts review that forecast
-and adjust it by dragging the curve on a chart -- see draggable_curve, a
-custom React component -- rather than editing 96 individual numbers by
-hand, and rate their own confidence. Once the delivery day has actually
-happened and its day-ahead auction has settled, admins can reveal the
-realized price and see whether each expert's adjustment improved or
-worsened accuracy (MAE) relative to the raw model forecast -- and aggregate
-that across experts on a scoreboard. The goal is to measure the value of
-human correction on top of the model, not just to collect opinions.
-Anomaly flagging is fully automatic (5th/95th percentile of that day's own
-forecast) -- there's no manual per-slot flag override anymore, now that
-editing happens via drag rather than a per-slot table.
+WHAT IT DOES
+------------
+A DNN produces a day-ahead forecast at 15-min resolution (96 slots/day).
+Experts adjust it by dragging the curve (see draggable_curve/) and rate
+their confidence. Once a delivery day settles, admins compare each
+expert's adjustment against the realized price (MAE) and aggregate results
+on a scoreboard. Anomaly flagging is automatic (5th/95th percentile of
+that day's own forecast) -- no manual override.
 
 ROLES
 -----
-- "expert": can only see and submit on the Review & Adjust page, and only
-  for their own submissions. Submissions are final -- no editing after
-  submit.
-- "admin": can view (but never submit on behalf of) any expert's Review &
-  Adjust page, plus the Reveal & Evaluate and Expert Scoreboard pages.
+- expert: Review & Adjust only, own submissions, final once submitted.
+- admin: everything, plus Reveal & Evaluate and Expert Scoreboard; can
+  view but never submit on an expert's behalf.
 
 DATA SOURCES
 ------------
-Two CSVs are pulled live from a GitHub repo on every page load (cached
-for 30 min to absorb the daily 10AM/14h refreshes without hammering
-GitHub): the DNN forecast and the realized Belgian market data (price,
-load, solar, wind, weather). See the GITHUB LOADING section below for the
-exact files/columns.
+Two CSVs pulled live from GitHub each page load (cached 30 min): the DNN
+forecast and realized Belgian market data (price, load, solar, wind,
+weather).
 
-UNCERTAINTY BANDS
-------------------
-The chart's uncertainty band is no longer a separate quantile-regression
-(QR) model's output. It's a single 80%-coverage margin, conformal-
-calibrated from the DNN forecast's own settled residuals via ACI (Adaptive
-Conformal Inference) -- see get_aci_margin(). Chosen over the alternative
-(WCP, a single fixed margin from historical residuals) because ACI
-self-adjusts: if recent predictions have been missing the realized price,
-the margin widens on its own; if they've been comfortably covering it, the
-margin relaxes -- no manual recalibration needed after a volatile stretch.
-Ported from a colleague's conformal-prediction notebook.
+UNCERTAINTY BAND
+-----------------
+The chart's band is a single 80%-coverage margin, conformal-calibrated
+from the DNN's own settled residuals via Adaptive Conformal Inference
+(get_aci_margin()) -- self-adjusting, no manual recalibration needed.
 
 PAGES
 -----
-1. Review & Adjust       -- the core workflow described above.
-2. Deterministic Forecast Analysis -- DNN forecast vs. actual settled price
-   over the last 14 days. This is the DNN-only slice of a broader LEAR/XGB/
-   DNN/Ensemble comparison a collaborator built separately; rendered
-   natively here with this app's own data pipeline and theme, not embedded
-   from her dashboard.
-3. Reveal & Evaluate (admin only) -- compares one expert's one-day
-   submission against the realized price once it has settled.
-4. Expert Scoreboard (admin only) -- aggregates every evaluated submission
-   across all experts into a leaderboard (avg. improvement, win rate, etc.).
-5. Survey Results (admin only) -- the post-submission reflection survey
-   (see render_submission_survey()): usability, comprehension of the
-   forecast/uncertainty band, and relevance of the added weather/renewables
-   context, shown once right after each successful submission -- plus a
-   one-time EPF-experience profile per user. Built for a research question
-   about whether/how human review improves EPF forecasts; joinable against
-   the "feedback" table's MAE evaluation on (username, forecast_date).
+1. Review & Adjust -- the core workflow above.
+2. Deterministic Forecast Analysis -- DNN vs. actual, last 14 days.
+3. Reveal & Evaluate (admin) -- MAE for one submission once settled.
+4. Expert Scoreboard (admin) -- aggregated MAE improvement per expert.
+5. Survey Results (admin) -- the reflection survey + experience profiles;
+   joinable against "submissions" on (username, forecast_date).
 
 THEMING
 -------
-A dark/light toggle in the sidebar injects CSS (see apply_theme()) and
-drives a matching Plotly template (see themed()) so charts and UI chrome
-never fall out of sync with each other.
-
-NAMING
-------
-The visible UI title says "RLHF" -- shorthand for the research framing
-behind this whole app: measuring whether human feedback improves a model's
-output, the same underlying idea as RLHF for language models, just applied
-here to electricity price forecasting instead. The module/variable names
-throughout the code still say "EPF Expert Review" since that's the more
-literal description of what the tool actually does day to day.
+apply_theme() injects CSS; themed() applies a matching Plotly template --
+both keyed off the same dark/light toggle, so nothing falls out of sync.
 """
 
 import streamlit as st
@@ -99,9 +64,10 @@ import requests
 from dotenv import load_dotenv
 
 from db import (
-    init_db, load_users, save_new_user, save_feedback, load_feedback, has_submitted,
+    init_db, load_users, save_new_user, save_submission, load_submissions, has_submitted,
+    DuplicateSubmissionError,
     get_user_profile, save_user_profile, load_all_user_profiles,
-    save_submission_survey, load_submission_survey,
+    save_submission_survey, load_submission_survey, has_completed_survey,
     get_onboarding_status, save_onboarding_status,
 )
 from draggable_curve import draggable_curve
@@ -315,6 +281,11 @@ def apply_theme():
             background-color: {palette['accent']} !important;
             border-color: {palette['accent']} !important;
         }}
+        /* Restore the question mark inside the tooltip icon */
+        [data-testid="stTooltipIcon"] svg {{
+            fill: none !important;
+            stroke: {palette['text_muted']} !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -448,15 +419,13 @@ def dnn_imputed_flags(forecast_date, dnn_df):
 
 
 def _forecast_vs_actual(dnn_df, be_df):
-    """Settled (forecast, actual) pairs -- shared prep for both conformal
-    methods below. Never includes the currently-forecast (unsettled) day,
-    same cutoff rule used everywhere else in this app.
+    """Settled (forecast, actual) pairs, shared prep for both conformal
+    methods below. Excludes the unsettled current day.
 
-    Rows with a missing forecast or actual value are dropped, not just left
-    in as NaN: ACI's residual pool is a fixed-size rolling window, so a
-    single NaN entering it poisons every np.quantile() call downstream
-    until that one value finally slides back out -- including, in the worst
-    case, the very last one, silently returning a NaN margin overall."""
+    Drops rows with a missing value rather than leaving NaN: ACI's residual
+    pool is a fixed-size rolling window, so one NaN poisons every
+    np.quantile() call until it slides back out -- possibly the last one,
+    silently returning a NaN margin overall."""
     last_evaluable = get_last_evaluable_ts()
     merged = (
         dnn_df.set_index("DateTime")["DNN_expanding"].rename("forecast")
@@ -470,27 +439,21 @@ def _forecast_vs_actual(dnn_df, be_df):
 
 @st.cache_data(ttl=1800)
 def get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30, min_calibration_days=5):
-    """Adaptive Conformal Inference margin, ported from method_ACI() in the
-    conformal-prediction notebook: after an initial calibration window,
-    replays every subsequent settled slot one at a time, self-correcting a
-    target quantile level (alpha_t) based on whether each prediction
-    actually covered the realized price. Returns the margin q as of the END
-    of that replay -- i.e. "right now" -- which is what gets applied to the
-    (unsettled) date currently being reviewed.
+    """Adaptive Conformal Inference margin (ported from method_ACI() in the
+    conformal-prediction notebook): after an initial calibration window,
+    replays every settled slot, self-correcting a target quantile
+    (alpha_t) based on whether each prediction covered the real price.
+    Returns the margin as of the end of that replay -- applied to the
+    currently-reviewed (unsettled) date.
 
-    The calibration window is ADAPTIVE, not a hard 30-day requirement: it
-    uses up to `calibration_days` of settled history, but shrinks down to
-    whatever's actually available (as low as `min_calibration_days`) rather
-    than refusing to produce a band at all just because the model hasn't
-    accumulated a full 30 days yet -- relevant right now since the DNN model
-    is newly launched and doesn't have that much history. At least one day
-    is always reserved for the replay itself, or there's nothing to adapt.
+    Calibration window is adaptive, not a hard 30 days: shrinks down to
+    `min_calibration_days` rather than refusing a band just because the
+    model is new and lacks history. At least one day is always reserved
+    for the replay itself.
 
-    This is genuinely sequential (each step depends on the previous one's
-    updated alpha_t), so it can't be vectorized -- the ttl cache is what
-    keeps it from being recomputed on every page interaction.
-    Returns None only if there's less than min_calibration_days + 1 days of
-    settled history total -- genuinely not enough to do anything with yet."""
+    Sequential by nature (each step depends on the last), so it can't be
+    vectorized -- the ttl cache avoids recomputing it on every interaction.
+    Returns None only if there's under min_calibration_days + 1 days total."""
     merged = _forecast_vs_actual(dnn_df, be_df)
 
     total_days = len(merged) // STEPS_PER_DAY
@@ -516,12 +479,9 @@ def get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30, mi
 
 
 def get_calendar_context(forecast_date):
-    """Belgian-holiday and bridge-day context for the day being reviewed --
-    surfaced as metrics on Review & Adjust since both are known drivers of
-    unusual demand/price shapes an expert should factor into their review.
-    A "bridge day" is a working day sandwiched between a holiday and a
-    weekend (Monday after a Tuesday holiday, or Friday before a Monday
-    holiday) -- often behaves like a de facto holiday for demand purposes."""
+    """Belgian holiday/bridge-day context -- both are known drivers of
+    unusual demand/price shapes. A "bridge day" is a working day between a
+    holiday and a weekend, often behaving like a de facto holiday."""
     be_holidays = holidays.Belgium(years=[forecast_date.year - 1, forecast_date.year, forecast_date.year + 1])
     is_holiday = forecast_date in be_holidays
 
@@ -542,23 +502,16 @@ def get_calendar_context(forecast_date):
 
 
 def get_dnn_history_window(dnn_df, be_df, days=14):
-    """DNN forecast vs actual over the last `days` days -- windowed exactly
-    the way Margarida's dashboard_app.py does it in Section 1
-    (get_plot_window_from_forecast + plot_two_series_allow_missing_actual),
-    ported to this app's own dnn_df/be_df rather than her separate
-    LEAR/XGB/Ensemble pipeline. Nothing else from her file (the scatter
-    diagnostics in Section 2, the full-history MAE/rMAE tables in Section 3)
-    is included here -- this is only the Section 1 chart, DNN-only.
+    """DNN forecast vs. actual, last `days` days -- windowed the same way
+    as Margarida's dashboard_app.py Section 1, DNN-only (not her scatter
+    diagnostics or MAE tables).
 
-    Two behaviors carried over deliberately, since they differ from a more
-    "obvious" implementation:
-      - The window ends at the LATEST available forecast timestamp, not the
-        latest settled day -- so it can include tomorrow's not-yet-settled
-        forecast, same as hers.
-      - Actual is reindexed onto the forecast's own dates rather than
-        inner-joined, so an unsettled day still shows its forecast line
-        (just with a gap where the actual price isn't in yet) instead of
-        disappearing from the window entirely.
+    Two deliberate, non-obvious choices:
+      - Window ends at the latest forecast timestamp, not the latest
+        settled day -- so it can include tomorrow's forecast, same as hers.
+      - Actual is reindexed onto forecast's dates, not inner-joined, so an
+        unsettled day still shows its forecast line (with a gap where the
+        actual isn't in yet) instead of disappearing entirely.
     """
     forecast = dnn_df.set_index("DateTime")["DNN_expanding"].rename("forecast").sort_index()
     if forecast.empty:
@@ -625,16 +578,9 @@ def make_renewables_chart(timestamps, solar=None, wind=None):
 
 
 def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_upper=None, flagged=None):
-    """Forecast vs. adjusted, with the uncertainty band and flagged anomaly
-    markers -- the read-only counterpart to the draggable_curve widget used
-    for live editing. Shows the same information (band, flags, forecast
-    reference, adjustment) as that widget, just as a static Plotly chart,
-    for admin-viewed or already-submitted work where dragging doesn't apply.
-    Replaces the old separate make_chart() (band + flags, no adjustment)
-    and the original bare-bones make_comparison_chart (forecast vs adjusted,
-    no band/flags) -- one function covering what both used to, now that
-    make_chart's only call site (the live top-of-page chart) has been
-    replaced entirely by draggable_curve."""
+    """Forecast vs. adjusted with the uncertainty band and flagged anomaly
+    markers -- the read-only counterpart to draggable_curve, for
+    admin-viewed or already-submitted work where dragging doesn't apply."""
     figure = go.Figure()
 
     if band_lower is not None and band_upper is not None:
@@ -672,16 +618,11 @@ def make_comparison_chart(timestamps, forecast, adjusted, band_lower=None, band_
 
 
 def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
-    """Custom HTML legend, styled to match draggable_curve's own hand-built
-    legend exactly -- same colors, same swatch shapes, same layout -- so the
-    visual language stays consistent whether the chart above is the
-    interactive drag widget (while editing) or the static Plotly chart
-    (read-only). Plotly's own native legend is turned off in
-    make_comparison_chart() in favor of this, since a Plotly-native legend
-    can't be restyled to look identical to hand-built HTML/CSS -- this is
-    two independently-maintained pieces of code (Python here, TypeScript in
-    DraggableCurve.tsx) that happen to produce matching pixels, not one
-    shared implementation; keep both in sync by hand if either changes."""
+    """Custom HTML legend matching draggable_curve's own hand-built one --
+    same colors/shapes/layout, so editing (drag widget) and read-only
+    (static Plotly chart) look consistent. Plotly's native legend is off in
+    make_comparison_chart() in favor of this; kept in sync by hand with
+    DraggableCurve.tsx's version, not shared code."""
     dark = st.session_state.get("dark_mode", True)
     palette = get_palette(dark)
 
@@ -707,12 +648,10 @@ def render_chart_legend(show_forecast=True, show_band=True, show_flagged=True):
 
 
 def make_history_chart(history_df):
-    """Predicted vs actual price over a multi-day window, matching the look
-    of Margarida's dashboard_app.py chart (DNN's terracotta line color, line
-    weights, unified hover, range slider, title style) but kept on our own
-    themed() wrapper instead of her fixed plotly_white template -- 'Actual'
-    uses the theme's own text color instead of her hardcoded near-black, so
-    it stays readable rather than nearly invisible against a dark background."""
+    """DNN vs. actual over a multi-day window, matching Margarida's
+    dashboard_app.py look (terracotta line, unified hover, range slider) --
+    but 'Actual' uses the theme's own text color instead of her hardcoded
+    near-black, so it stays visible in dark mode."""
     dark = st.session_state.get("dark_mode", True)
     palette = get_palette(dark)
 
@@ -770,24 +709,22 @@ def validate_registration(username, email, password):
 # --------------------------------------------------------------------------
 
 def render_submission_survey(expert_id, forecast_date, survey_key):
-    """One-time reflection survey shown immediately after a successful
-    submission -- the natural "moment of success" to ask, rather than an
-    always-available, easy-to-ignore sidebar widget. Built for a specific
-    research question (does human review/correction actually help EPF
-    forecasts, and does the tool's design support that): usability and
-    comprehension matter because a low score on either casts doubt on
-    whether an adjustment (and its self-reported confidence) reflects
-    genuine judgment rather than confusion; context-relevance directly
-    tests whether the extra weather/renewables data in this app helped
-    calibration or was just decoration. Experience level is asked ONCE per
-    user (see get_user_profile) since it's a stable trait, not something
-    that changes submission to submission -- a moderator variable for
-    later analysis, not a per-session measure.
+    """One-time-ever reflection survey, shown after a user's first
+    submission and never again (gated by has_completed_survey() in the
+    caller, checked across all submissions, not just today's).
 
-    Skippable by design, not mandatory: trapping the user with a required
-    form would hurt response quality more than a missed response costs --
-    worth noting as a limitation if response rate becomes relevant in the
-    writeup."""
+    Research purpose: usability/comprehension scores matter because a low
+    one casts doubt on whether an adjustment reflects genuine judgment;
+    context-relevance tests whether the weather/renewables data actually
+    helped or was decoration. Experience level is a stable trait, asked
+    once, not a per-session measure.
+
+    Confidence is unaffected -- it's on a separate table ("submissions"),
+    tied to each forecast_date, asked every time.
+
+    Skippable, not mandatory (a required form would hurt response quality
+    more than a miss costs). Skipping writes no row, so it's offered again
+    next time rather than marked done."""
     st.divider()
     st.subheader("Quick reflection")
     st.caption("A few questions for the research behind this tool -- not about the forecast itself.")
@@ -803,13 +740,22 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
                 value="Some familiarity",
             )
 
-        usability = st.slider("How easy was it to use this application for this task?", 1, 5, 3)
-        comprehension = st.slider(
-            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 1, 5, 3
+        usability = st.slider(
+            "How easy was it to use this application for this task?", 
+            1, 5, 3,
+            help="1 = Very difficult | 5 = Very easy"
         )
+
+        comprehension = st.slider(
+            "How well did you understand the forecast chart and uncertainty band (shaded region)?", 
+            1, 5, 3,
+            help="1 = Did not understand at all | 5 = Understood perfectly"
+        )
+
         context_relevance = st.slider(
             "How useful was the additional context (temperature, humidity, solar/wind) for making your adjustment?",
             1, 5, 3,
+            help="1 = Not at all useful | 5 = Extremely useful"
         )
         comment = st.text_area("Anything else you'd like to share about this session? (optional)", height=80)
 
@@ -832,14 +778,11 @@ def render_submission_survey(expert_id, forecast_date, survey_key):
 
 
 def page_review_and_adjust():
-    """The core page: load today's (or a selected) forecast, show context and
-    charts, and let an expert review/adjust it 15-minute-slot by slot.
-
-    Behavior differs by who's looking and whether feedback was submitted:
-      - expert, not yet submitted -> editable (see the st.form block below)
-      - expert, already submitted -> read-only, "already submitted" notice
-      - admin (any state)         -> always read-only; admins can view any
-        expert's work but can never submit on their behalf
+    """Core page: load a forecast, show context/charts, let an expert
+    adjust it. Behavior by state:
+      - expert, not submitted -> editable (drag + confidence + submit)
+      - expert, already submitted -> read-only, "already submitted"
+      - admin -> always read-only, can view but never submit for someone
     """
     current_user = st.session_state["logged_in_user"]
     current_role = st.session_state["role"]
@@ -882,27 +825,19 @@ def page_review_and_adjust():
             "carried forward. Treat this forecast with extra caution."
         )
 
-    # Uncertainty band: ACI margin (see get_aci_margin), not the retired QR
-    # model -- a single symmetric margin around the point forecast,
-    # calibrated from settled (forecast, actual) history and continuously
-    # self-adjusted (see the docstring for why ACI specifically).
+    # ACI margin, not the retired QR model -- see get_aci_margin() for why.
     margin = get_aci_margin(dnn_df, be_df, alpha=0.2, gamma=0.01, calibration_days=30)
 
     calendar_ctx = get_calendar_context(forecast_date)
     day_rows = be_df.loc[be_df["date_only"] == forecast_date].sort_values("Date")
 
-    # Weather/load context is only available once the actuals feed has caught
-    # up to this date -- e.g. tomorrow's forecast reviewed today won't have it yet.
-    # French demand is deliberately NOT surfaced here: France's demand sits on a
-    # completely different scale from Belgium's, so a side-by-side comparison
-    # wasn't actually useful context for judging the Belgian forecast.
+    # Weather/load context needs the actuals feed caught up to this date.
+    # French demand isn't shown: different scale from Belgium's, not useful
+    # for judging this forecast.
     #
-    # NET (residual) demand, not gross: price is set by the marginal generator
-    # covering demand AFTER renewables (near-zero marginal cost, don't set
-    # price) are already subtracted -- net demand tracks price movements in a
-    # way gross demand doesn't (a high-gross/high-wind day can be unremarkable
-    # for price; a modest-gross/no-wind day can spike). Also keeps this number
-    # consistent with why Solar & Wind stay visible by default below.
+    # Net (residual) demand, not gross: price is set by the generator
+    # covering demand AFTER renewables (near-zero marginal cost) are
+    # subtracted, so net demand tracks price in a way gross doesn't.
     if len(day_rows) == STEPS_PER_DAY:
         wind_total_day = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
         net_demand = (day_rows["Load_BE"] - day_rows["Solar_BE"] - wind_total_day).mean()
@@ -917,11 +852,8 @@ def page_review_and_adjust():
     c2.metric("Holiday?", calendar_ctx["holiday_name"] if calendar_ctx["is_holiday"] else "No")
     c3.metric("Bridge day?", "Yes" if calendar_ctx["is_bridge_day"] else "No")
 
-    # Net demand and the temp/humidity averages are single numbers -- they
-    # fit fine in the sidebar. The toggles below control whether the actual
-    # hourly charts render, but the charts themselves appear on the main
-    # page (see after Solar & Wind), not in the sidebar -- the sidebar
-    # widget just captures the on/off state.
+    # Toggles live in the sidebar; the charts they control render on the
+    # main page (see after Solar & Wind), not here.
     with st.sidebar:
         st.divider()
         st.subheader("Day info")
@@ -961,11 +893,9 @@ def page_review_and_adjust():
             "Indicate the confidence level in your results before submission."
         )
 
-    # --- Auto-flag volatile slots (5th/95th percentile of this day's own forecast) ---
-    # Relative to THIS day's own distribution, not a fixed EUR/MWh threshold --
-    # so a generally-volatile day and a generally-calm day each get flagged
-    # relative to their own baseline, rather than one fixed cutoff favoring
-    # whichever kind of day happens to be more extreme in absolute terms.
+    # Auto-flag: 5th/95th percentile of THIS day's own forecast, not a
+    # fixed EUR/MWh threshold -- so calm and volatile days each get flagged
+    # relative to their own baseline.
     low_threshold = np.percentile(forecast, 5)
     high_threshold = np.percentile(forecast, 95)
     flagged = (forecast <= low_threshold) | (forecast >= high_threshold)
@@ -973,13 +903,9 @@ def page_review_and_adjust():
     hour_of_slot = np.array([pd.Timestamp(ts).hour for ts in timestamps])
     time_label = [pd.Timestamp(ts).strftime("%H:%M") for ts in timestamps]
 
-    # "adjusted" starts as an exact copy of "forecast", pre-rounded to 2
-    # decimals here so it can never drift from the forecast column when the
-    # drag component or Streamlit's own widgets re-serialize it -- the two
-    # columns need to be bit-identical until the expert actually changes a
-    # value. Moved up here (before the chart, not after it) so the chart
-    # itself -- draggable or static -- can be built from `working` and show
-    # the adjustment alongside the forecast, band, and flags all at once.
+    # "adjusted" starts as an exact copy of "forecast" (pre-rounded so they
+    # stay bit-identical) until the expert changes a value. Built before the
+    # chart so it can show forecast, band, and flags together.
     working_df = pd.DataFrame({
         "timestamp_slot": timestamps,
         "hour": hour_of_slot,
@@ -987,7 +913,6 @@ def page_review_and_adjust():
         "forecast": np.round(forecast, 2),
         "adjusted": np.round(forecast, 2),
         "flagged": flagged,
-        "load_fr": day_rows["Load_FR"].values if context_available else np.nan,
     })
 
     key = f"{expert_id}_{forecast_date}"  # one working copy per (expert, date) pair in session state
@@ -996,11 +921,9 @@ def page_review_and_adjust():
     is_read_only = (current_role == "admin")
 
     if key not in st.session_state:
-        # First time this (expert, date) combo is opened this session: if the
-        # expert has a prior unsubmitted session for this exact date (they
-        # navigated away and came back before hitting Submit), restore their
-        # in-progress edits instead of resetting to the raw forecast.
-        log = load_feedback()
+        # Restore a prior unsubmitted session (navigated away before
+        # submitting) instead of resetting to the raw forecast.
+        log = load_submissions()
         if not log.empty:
             past_sub = log[(log["expert_id"] == expert_id) & (log["forecast_date"] == forecast_date)]
             if not past_sub.empty:
@@ -1012,17 +935,13 @@ def page_review_and_adjust():
 
     working = st.session_state[key]
 
-    # The band belongs to the ORIGINAL forecast, not the adjusted line --
-    # ACI's margin is calibrated against the model's own historical error,
-    # so it doesn't move just because an expert drags a point.
+    # Band belongs to the original forecast, not the adjusted line -- ACI
+    # is calibrated on the model's own error, unaffected by drags.
     band_lower = (working["forecast"] - margin).tolist() if margin is not None else None
     band_upper = (working["forecast"] + margin).tolist() if margin is not None else None
 
-    # --- The main chart: draggable while editing, static once there's
-    # nothing left to drag. Both show the same information together --
-    # forecast, adjustment, uncertainty band, flagged points -- so editing
-    # happens directly on "the real chart" instead of a separate, stripped-
-    # down widget underneath a static reference chart.
+    # Draggable while editing, static once there's nothing left to drag --
+    # both show forecast/adjustment/band/flags together.
     if is_read_only or already_submitted:
         st.plotly_chart(
             make_comparison_chart(
@@ -1059,16 +978,14 @@ def page_review_and_adjust():
         st.caption(f"Current ACI margin: ± {margin:.2f} EUR/MWh")
 
 
-    # Solar & Wind and Weather sit one under the other (not side-by-side):
-    # Solar+wind are genuinely linked (their combined dip drives net demand
-    # and price spikes -- Load_BE - Solar_BE - Wind_BE would be net demand),
-    # so they share one chart here.
+    # Solar+wind share one chart: their combined dip drives net demand and
+    # price spikes.
     if context_available:
         with st.container(border=True):
             st.subheader("Solar & Wind - Renewables")
             sc1, sc2 = st.columns(2)
-            show_solar = sc1.toggle("☀️ Solar", value=True)
-            show_wind = sc2.toggle("💨 Wind", value=True)
+            show_solar = sc1.toggle("Solar", value=True)
+            show_wind = sc2.toggle("Wind", value=True)
 
             wind_total = day_rows["Wind_Offshore_BE"] + day_rows["Wind_Onshore_BE"]
             solar_vals = day_rows["Solar_BE"].values if show_solar else None
@@ -1080,10 +997,7 @@ def page_review_and_adjust():
                 st.plotly_chart(make_renewables_chart(day_rows["Date"].values, solar=solar_vals, wind=wind_vals),
                                 width="stretch")
 
-        # Driven by the "Show Temperature/Humidity plot" toggles in the
-        # sidebar's Day info section -- the widgets live there, but the
-        # actual charts render here on the main page, full width, rather
-        # than cramped into the sidebar.
+        # Toggles live in the sidebar; charts render here, full width.
         if show_temp_sidebar and show_hum_sidebar:
             wc1, wc2 = st.columns(2)
             with wc1:
@@ -1107,27 +1021,23 @@ def page_review_and_adjust():
                 width="stretch",
             )
 
-    # --- Footer: role/status-specific. The survey appears exactly once,
-    # right after a fresh submission -- afterward it's the normal info
-    # message on every subsequent visit to this same (expert, date) page. ---
+    # Footer: the reflection survey is one-time-ever (has_completed_survey
+    # checks all submissions, not just today's); confidence is unaffected,
+    # asked every time via the separate "submissions" table.
     if is_read_only or already_submitted:
         if is_read_only:
             st.info(f"Viewing {expert_id}'s submission (read-only — admins cannot submit on behalf of experts).")
-        elif st.session_state.get(survey_key, False):
+        elif st.session_state.get(survey_key, False) and not has_completed_survey(expert_id):
             render_submission_survey(expert_id, forecast_date, survey_key)
         else:
             st.info(f"You've already submitted feedback for {forecast_date}. Submissions are final.")
     else:
-        # No form needed: unlike the old 24-table version, there's nothing
-        # left to batch -- dragging already updates st.session_state[key]
-        # and reruns on every drag-release (see draggable_curve's own
-        # __init__.py), so `working` is already current by the time Submit
-        # is clicked, and the slider/button are the only other widgets here.
+        # No form needed: dragging already updates session state and
+        # reruns on release, so `working` is current by the time Submit
+        # is clicked.
         #
-        # Trade-off worth knowing: the old per-slot "Flag" checkbox let an
-        # expert manually flag/unflag individual slots. That's gone now --
-        # `flagged` is purely the auto-detected 5th/95th percentile array
-        # computed above, with no manual override.
+        # Trade-off: the old per-slot "Flag" checkbox is gone -- `flagged`
+        # is now purely automatic, no manual override.
         with st.container(border=True):
             st.subheader("Your confidence")
             confidence = st.slider("How confident are you in these adjustments? (1-no confidence, 5-highest confidence)", 1, 5, 3)
@@ -1137,7 +1047,10 @@ def page_review_and_adjust():
             if not expert_id:
                 st.error("Error: No Expert ID found.")
             elif has_submitted(expert_id, forecast_date):
-                # Guards against a double-submit race (e.g. two tabs open on the same date).
+                # Guards against a double-submit race (e.g. two tabs open on the same date) --
+                # the fast-path check for the normal case. The DuplicateSubmissionError catch
+                # below is the actual, database-enforced backstop for the rare case where two
+                # near-simultaneous submissions both pass this check before either commits.
                 st.error("A submission already exists for this date. Refresh the page.")
             else:
                 rows = working.copy()
@@ -1145,10 +1058,14 @@ def page_review_and_adjust():
                 rows["forecast_date"] = forecast_date
                 rows["timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 rows["confidence"] = confidence
-                save_feedback(rows)
-                st.session_state[survey_key] = True  # triggers render_submission_survey() on the next render
-                render_success_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.")
-                st.rerun()  # forces the page back into the read-only branch above
+                try:
+                    save_submission(rows)
+                except DuplicateSubmissionError:
+                    st.error("A submission already exists for this date. Refresh the page.")
+                else:
+                    st.session_state[survey_key] = True  # triggers render_submission_survey() on the next render
+                    render_success_banner(f"Forecast submitted for {forecast_date}! Saved {len(rows)} adjusted values.")
+                    st.rerun()  # forces the page back into the read-only branch above
 
 
 # --------------------------------------------------------------------------
@@ -1156,26 +1073,20 @@ def page_review_and_adjust():
 # --------------------------------------------------------------------------
 
 def get_last_evaluable_ts(now=None):
-    """Never evaluate against a delivery day whose day-ahead auction hasn't
-    settled yet. Belgian day-ahead prices for a delivery day are published
-    the day before delivery -- so "today's" prices are already known, but
-    "tomorrow's" (the day currently being forecast, relative to `now`) are
-    not, even if the actuals feed happens to already contain a stale/
-    placeholder value for it. `now` is injectable for testing; production
-    calls always use the default (current time in Europe/Brussels)."""
+    """Cutoff for evaluable data: Belgian day-ahead prices publish the day
+    before delivery, so "tomorrow" isn't settled yet even if the actuals
+    feed has a stale placeholder for it. `now` is injectable for testing."""
     now = now if now is not None else pd.Timestamp.now(tz="Europe/Brussels").tz_localize(None)
     tomorrow_start = now.normalize() + pd.Timedelta(days=1)
     return tomorrow_start - pd.Timedelta(minutes=15)
 
 
 def page_reveal_and_evaluate():
-    """Admin-only page: pick one expert's one-day submission and, once that
-    day's prices have settled, compare the original DNN forecast and the
-    expert's adjusted values against the realized price (MAE for each) to
-    see whether the human adjustment helped, hurt, or made no difference."""
+    """Admin-only: pick one expert's one-day submission and, once settled,
+    compare forecast vs. adjusted against the realized price (MAE each)."""
     st.title("Reveal & Evaluate")
 
-    log = load_feedback()
+    log = load_submissions()
     if log.empty:
         st.warning("No submissions yet.")
         return
@@ -1247,13 +1158,12 @@ def page_reveal_and_evaluate():
 # --------------------------------------------------------------------------
 
 def page_expert_scoreboard():
-    """Admin-only page: aggregates every (expert, date) submission that has
-    a settled actual price into a per-expert leaderboard -- average
-    improvement in MAE, days reviewed, win rate (% of days where the
-    adjustment beat the raw forecast), and average stated confidence."""
+    """Admin-only: aggregates every settled (expert, date) submission into
+    a per-expert leaderboard -- avg. MAE improvement, days reviewed, win
+    rate, avg. confidence."""
     st.title("Expert Scoreboard")
 
-    log = load_feedback()
+    log = load_submissions()
     if log.empty:
         st.warning("No submissions yet.")
         return
@@ -1366,21 +1276,17 @@ ONBOARDING_STEPS = [
             "Once you're happy with your adjustment, rate how confident you are and "
             "click Submit. Submissions are final. There's no editing afterward. "
             "Right after submitting, you'll be asked a few short reflection "
-            "questions. That's the actual research data this study is collecting, "
-            "so please answer honestly."
+            "questions. Please answer honestly."
         ),
     },
 ]
 
 
 def render_onboarding(username):
-    """Blocks access to the rest of the app until a user has (a) acknowledged
-    the research-purposes disclaimer and (b) stepped through a short
-    walkthrough of how the app works. Shown once per user -- persisted to
-    the database (onboarding_status), not just session state, so it's a
-    true one-time gate rather than something re-shown every login. Applies
-    to every role, including admins, so the disclaimer is unambiguously
-    seen by everyone rather than assuming admins already know it."""
+    """Blocks the rest of the app until a user has consented to the
+    research disclaimer and completed the tutorial -- persisted in the DB
+    (onboarding_status), so it's a true one-time gate, not per-session.
+    Applies to every role, including admins."""
     step_idx_key = f"onboarding_step_idx_{username}"
     if step_idx_key not in st.session_state:
         st.session_state[step_idx_key] = 0
@@ -1425,15 +1331,10 @@ def render_onboarding(username):
 
 
 def render_success_banner(message):
-    """A guaranteed-green success banner for the two "you did it" moments
-    (forecast submitted, reflection submitted). Built as plain HTML rather
-    than st.success(): apply_theme()'s blanket [data-testid="stAlert"]
-    override -- needed to theme info/warning/error consistently across
-    dark/light mode -- also flattens Streamlit's own built-in green styling
-    for success messages specifically, since success/info/warning/error all
-    share that same testid. Rather than gamble on an unverified per-type
-    selector, this sidesteps the ambiguity entirely with its own fixed,
-    theme-aware green."""
+    """Guaranteed-green success banner, built as plain HTML rather than
+    st.success(): apply_theme()'s [data-testid="stAlert"] override (needed
+    for consistent info/warning/error theming) also flattens Streamlit's
+    own green styling, since all four alert types share that testid."""
     dark = st.session_state.get("dark_mode", True)
     text_color = "#4ade80" if dark else "#15803d"
     bg_color = "rgba(34,197,94,0.15)" if dark else "rgba(34,197,94,0.12)"
@@ -1450,10 +1351,9 @@ def render_success_banner(message):
 # --------------------------------------------------------------------------
 
 def auth_screen():
-    """Login / self-registration screen, shown instead of any page content
-    when nobody is logged in yet (see main()). Self-registration only offers
-    the "expert" role (EXPERT_ROLES) -- admin accounts must be created
-    directly in the database, not through this UI."""
+    """Login/registration, shown when nobody's logged in (see main()).
+    Self-registration only offers "expert" -- admins are created directly
+    in the database."""
     st.subheader("Welcome to EPF Expert Review")
 
     auth_mode = st.radio("Choose an option:", ["Log In", "Create Account"], horizontal=True)
@@ -1497,11 +1397,8 @@ def auth_screen():
 
 
 def page_dnn_history():
-    """DNN-only slice of Margarida's Section 1 chart (forecast vs actual,
-    last N days) -- natively rendered in this app's own theme using
-    dnn_df/be_df, no iframe, no external dependency on her Hugging Face
-    Space. Deliberately just the chart: her Section 2 (scatter diagnostics)
-    and Section 3 (full-history MAE/rMAE tables) aren't part of this page."""
+    """DNN-only slice of Margarida's Section 1 chart, natively rendered in
+    this app's own theme -- not her scatter diagnostics or MAE tables."""
     st.title("Deterministic Forecast Analysis — DNN")
     st.caption("DNN forecast vs. actual settled price, last 14 days.")
 
@@ -1518,12 +1415,8 @@ def page_dnn_history():
 
 
 def page_survey_results():
-    """Admin-only page: the post-submission reflection survey data (see
-    render_submission_survey() on Review & Adjust) plus the one-time
-    experience-level profile per user. Built for exporting into whatever
-    actual statistical analysis the research paper needs -- this page shows
-    summaries and lets you download the raw data, it deliberately doesn't
-    try to compute correlations or run the analysis itself."""
+    """Admin-only: reflection survey data plus one-time experience
+    profiles. Summaries + raw-data export only -- no analysis here."""
     st.title("Survey Results")
 
     survey_df = load_submission_survey()
